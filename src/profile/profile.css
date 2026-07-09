@@ -1,0 +1,309 @@
+.profile-popover {
+  width: 100vw;
+  height: 100vh;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto auto auto auto auto 1fr;
+  gap: 10px;
+  padding: 14px 16px;
+  background: var(--color-surface-widget);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-border-default);
+  border-radius: 14px;
+}
+
+.profile-header,
+.profile-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.profile-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 760;
+}
+
+.profile-brand__flame {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  background: linear-gradient(145deg, #ef4444, #ff8a34 55%, #f6c85f);
+}
+
+.profile-section-head {
+  color: var(--color-text-secondary);
+  font-size: 10px;
+}
+
+.profile-panel,
+.profile-metric,
+.profile-year-stats span {
+  border: 1px solid var(--color-border-default);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.profile-heatmap {
+  padding: 11px;
+}
+
+.profile-heatmap__days {
+  display: grid;
+  grid-template-columns: repeat(53, minmax(0, 1fr));
+  grid-template-rows: repeat(7, minmax(0, 1fr));
+  grid-auto-flow: column;
+  gap: 2px;
+  margin-top: 9px;
+}
+
+.profile-heatmap__day,
+.profile-heatmap__placeholder {
+  min-width: 0;
+  aspect-ratio: 1;
+  border-radius: 2px;
+  background: #202733;
+}
+
+.profile-heatmap__placeholder {
+  background: transparent;
+}
+
+.profile-heatmap__day[data-intensity="1"] { background: rgba(255, 138, 52, 0.28); }
+.profile-heatmap__day[data-intensity="2"] { background: rgba(255, 138, 52, 0.48); }
+.profile-heatmap__day[data-intensity="3"] { background: rgba(255, 138, 52, 0.72); }
+.profile-heatmap__day[data-intensity="4"] { background: #ff8a34; }
+
+.profile-heatmap__months {
+  display: grid;
+  grid-template-columns: repeat(53, minmax(0, 1fr));
+  margin-top: 7px;
+  color: var(--color-text-secondary);
+  font-size: 9px;
+}
+
+.profile-heatmap__months span {
+  min-width: 0;
+  overflow: visible;
+  white-space: nowrap;
+}
+
+.profile-heatmap__summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 9px;
+  color: var(--color-text-secondary);
+  font-size: 10px;
+}
+
+.profile-year-stats {
+  display: grid;
+  gap: 8px;
+}
+
+.profile-year-stats {
+  grid-template-columns: 1.2fr 0.72fr 1.05fr;
+}
+
+.profile-metric-grid {
+  display: grid;
+  grid-template-columns: 1.3fr 0.9fr;
+  gap: 8px;
+}
+
+.profile-year-stats span,
+.profile-metric {
+  min-width: 0;
+  padding: 7px 8px;
+}
+
+.profile-year-stats em,
+.profile-label {
+  display: block;
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  font-style: normal;
+}
+
+.profile-year-stats strong,
+.profile-metric strong {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-year-stats small {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-metric strong {
+  font-size: 22px;
+}
+
+.profile-metric span {
+  display: block;
+  margin-top: 2px;
+  color: var(--color-text-secondary);
+  font-size: 10px;
+}
+
+.profile-period-filter {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.profile-period-filter__button {
+  border: 0;
+  border-radius: 6px;
+  padding: 5px 0;
+  color: var(--color-text-secondary);
+  background: transparent;
+  font-size: 11px;
+}
+
+.profile-period-filter__button[aria-selected="true"] {
+  color: #1c1008;
+  background: #ff8a34;
+  font-weight: 760;
+}
+
+.profile-attribution-grid {
+  display: grid;
+  grid-template-columns: 0.9fr 1.3fr;
+  gap: 10px;
+  min-height: 0;
+}
+
+.profile-list {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  padding: 9px;
+}
+
+.profile-ranked-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 52px;
+  gap: 8px;
+  align-items: center;
+  color: var(--color-text-secondary);
+  font-size: 10px;
+}
+
+.profile-ranked-row__name {
+  overflow: hidden;
+  color: var(--color-text-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-ranked-row__track {
+  grid-column: 1 / -1;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #242b35;
+}
+
+.profile-ranked-row__track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #ff8a34;
+}
+
+.profile-sources {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  padding: 9px;
+}
+
+.profile-source-body {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  justify-items: center;
+  margin-top: 14px;
+}
+
+.profile-source-pie {
+  position: relative;
+  width: 88px;
+  height: 88px;
+  border-radius: 999px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.profile-source-pie::after {
+  content: "";
+  position: absolute;
+  inset: 27px;
+  border-radius: inherit;
+  background: var(--color-surface-widget);
+  box-shadow: 0 0 0 1px var(--color-border-default);
+}
+
+.profile-source-legend {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 10px;
+}
+
+.profile-source-legend__row {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr);
+  gap: 6px;
+  align-items: center;
+  color: var(--color-text-secondary);
+  font-size: 10px;
+}
+
+.profile-source-legend__row i {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+}
+
+.profile-source-legend__row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-empty-heatmap {
+  padding: 10px;
+}
+
+.profile-empty-heatmap__grid {
+  height: 52px;
+  border-radius: 6px;
+  background:
+    repeating-linear-gradient(90deg, #202733 0 4px, transparent 4px 6px),
+    repeating-linear-gradient(180deg, transparent 0 4px, rgba(255, 255, 255, 0.03) 4px 6px);
+  opacity: 0.55;
+}

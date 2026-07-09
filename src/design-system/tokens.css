@@ -1,0 +1,14 @@
+:root {
+  --color-surface-widget: rgba(7, 10, 15, 0.9);
+  --color-surface-widget-strong: rgba(16, 22, 32, 0.94);
+  --color-text-primary: #edf3fb;
+  --color-text-secondary: #b8c3d1;
+  --color-text-muted: #7d8898;
+  --color-status-green: #36f28a;
+  --color-status-yellow: #ffd166;
+  --color-status-red: #ff6b6b;
+  --color-border-default: rgba(184, 195, 209, 0.2);
+  --font-family-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  --font-family-mono: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
+  --shadow-widget: none;
+}

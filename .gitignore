@@ -1,0 +1,8 @@
+.worktrees/
+.superpowers/
+node_modules/
+.pnpm-store/
+dist/
+src-tauri/bin/
+src-tauri/gen/
+src-tauri/target/

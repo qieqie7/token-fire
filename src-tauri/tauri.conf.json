@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TokenFire",
+  "version": "0.1.0",
+  "identifier": "dev.tokenfire.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "TokenFire",
+        "width": 428,
+        "height": 572,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "resizable": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "category": "Utility",
+    "icon": ["icons/icon.png", "icons/icon.icns"],
+    "resources": ["icons/tray-icon.png"],
+    "externalBin": ["bin/token-fire-hook"],
+    "macOS": {
+      "entitlements": null,
+      "hardenedRuntime": false,
+      "minimumSystemVersion": "12.0"
+    }
+  }
+}
