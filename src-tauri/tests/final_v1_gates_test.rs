@@ -483,6 +483,101 @@ fn smoke_scripts_run_version_guard_before_builds() {
 }
 
 #[test]
+fn local_release_script_exists_and_builds_full_dmg_bundle() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script_path = manifest_dir.join("../scripts/local-release.sh");
+    let script = fs::read_to_string(&script_path).unwrap();
+
+    assert!(script.contains("pnpm tauri build"));
+    assert!(!script.contains("pnpm tauri build --bundles app"));
+    assert!(script.contains("src-tauri/target/release/bundle/dmg"));
+    assert!(script.contains("TokenFire.app/Contents/MacOS/token-fire"));
+    assert!(script.contains("TokenFire.app/Contents/MacOS/token-fire-hook"));
+    assert!(script.contains("TokenFire.app/Contents/Resources/icons/tray-icon.png"));
+}
+
+#[test]
+fn local_release_script_prepares_dist_assets_without_remote_release() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = fs::read_to_string(manifest_dir.join("../scripts/local-release.sh")).unwrap();
+
+    assert!(script.contains("rm -rf dist"));
+    assert!(script.contains("mkdir -p dist"));
+    assert!(script.contains(".sha256"));
+    assert!(script.contains("release-notes-v"));
+    assert!(script.contains("shasum -a 256"));
+    assert!(script.contains("git check-ignore -q dist"));
+    assert!(!script.contains("corepack"));
+    assert!(!script.contains("mapfile"));
+    assert!(!script.contains("readarray"));
+    assert!(!script.contains("gh release create"));
+    assert!(!script.contains(".github/workflows"));
+}
+
+#[test]
+fn local_release_script_cleans_frontend_dist_before_copying_release_assets() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = fs::read_to_string(manifest_dir.join("../scripts/local-release.sh")).unwrap();
+
+    let tauri_build = script.find("pnpm tauri build").unwrap();
+    let cleanup = script
+        .find("==> 清理 dist 发布目录")
+        .expect("local release script should clean dist after Tauri build rewrites frontend assets");
+    let copy_assets = script.find("==> 复制发布资产").unwrap();
+
+    assert!(tauri_build < cleanup);
+    assert!(cleanup < copy_assets);
+    assert!(script[cleanup..copy_assets].contains("rm -rf dist"));
+    assert!(script[cleanup..copy_assets].contains("mkdir -p dist"));
+}
+
+#[test]
+fn local_release_script_uses_shared_release_identity_checks() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = fs::read_to_string(manifest_dir.join("../scripts/local-release.sh")).unwrap();
+
+    let version_guard = script.find("pnpm release:check-version").unwrap();
+    let build_identity_env = script
+        .find("pnpm --silent release:build-identity-env")
+        .unwrap();
+    let cargo_build = script.find("cargo build").unwrap();
+    let pnpm_build = script.find("pnpm build").unwrap();
+    let tauri_build = script.find("pnpm tauri build").unwrap();
+
+    assert!(script.contains(
+        "export TOKEN_FIRE_GIT_COMMIT TOKEN_FIRE_GIT_COMMIT_SHORT TOKEN_FIRE_GIT_DIRTY TOKEN_FIRE_BUILD_TIME"
+    ));
+    assert!(version_guard < cargo_build);
+    assert!(version_guard < pnpm_build);
+    assert!(version_guard < tauri_build);
+    assert!(build_identity_env < cargo_build);
+    assert!(build_identity_env < pnpm_build);
+    assert!(build_identity_env < tauri_build);
+    assert!(script.contains("\"${app_bin_path}\" --version-json"));
+    assert!(script.contains("\"${app_hook_path}\" --version-json"));
+    assert!(script.contains("node scripts/check-build-identity-output.mjs"));
+    assert!(script.contains("\"${TOKEN_FIRE_GIT_COMMIT}\""));
+    assert!(!script.contains("extract_json_string"));
+    assert!(!script.contains("extract_cargo_version"));
+}
+
+#[test]
+fn readme_documents_local_release_and_free_distribution_limits() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = fs::read_to_string(manifest_dir.join("../README.md")).unwrap();
+
+    assert!(readme.contains("本地发布"));
+    assert!(readme.contains("scripts/local-release.sh"));
+    assert!(readme.contains("dist/"));
+    assert!(readme.contains("TokenFire Profile 截图"));
+    assert!(readme.contains("Developer ID"));
+    assert!(readme.contains("Apple notarization"));
+    assert!(readme.contains("xattr -dr com.apple.quarantine /Applications/TokenFire.app"));
+    assert!(!readme.contains("What It Shows"));
+    assert!(!readme.contains("Repository Layout"));
+}
+
+#[test]
 fn tray_refresh_fallback_interval_is_low_frequency() {
     assert_eq!(TRAY_REFRESH_FALLBACK_INTERVAL, StdDuration::from_secs(300));
     assert_ne!(TRAY_REFRESH_FALLBACK_INTERVAL, StdDuration::from_secs(1));
