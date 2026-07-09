@@ -47,4 +47,16 @@ describe("profile css", () => {
     expect(css).not.toContain("height: 198px;");
     expect(css).not.toContain("overflow-y: auto");
   });
+
+  it("keeps the Profile version mark compact in the header", () => {
+    const css = readFileSync(profileCssPath, "utf8");
+    const header = cssBlock(css, ".profile-header");
+    const version = cssBlock(css, ".profile-version");
+
+    expect(header).toContain("min-width: 0;");
+    expect(version).toContain("max-width: 190px;");
+    expect(version).toContain("text-overflow: ellipsis;");
+    expect(version).toContain("white-space: nowrap;");
+    expect(version).toContain("font-family: var(--font-family-mono);");
+  });
 });

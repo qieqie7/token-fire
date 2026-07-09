@@ -8,6 +8,7 @@ use serde_json::{json, Map, Value};
 
 use crate::adapters::source::SourceStatus;
 use crate::adapters::traex::status::TraexStatus;
+use crate::app::build_identity::current_build_identity;
 use crate::app::logging::{sanitize_value, FORBIDDEN_LOG_KEYS};
 use crate::app::paths::RuntimePaths;
 use crate::core::usage_store::{RetentionPolicy, UsageStore};
@@ -108,6 +109,7 @@ pub fn create_debug_bundle_with_source_statuses_and_runtime_health(
     };
     let bundle = json!({
         "created_at": chrono::Utc::now().to_rfc3339(),
+        "build_identity": build_identity_diagnostic(&paths.hook_log),
         "events": events,
         "sqlite_metadata": sqlite_metadata,
         "retention": retention,
@@ -134,6 +136,102 @@ pub fn create_debug_bundle_with_source_statuses_and_runtime_health(
     ));
     fs::write(&path, serde_json::to_string_pretty(&bundle)?)?;
     Ok(path)
+}
+
+fn hook_sidecar_identity(hook_log_path: &Path) -> Value {
+    if let Some(identity) = recent_hook_log_identity(hook_log_path) {
+        return identity;
+    }
+    adjacent_hook_sidecar_identity()
+}
+
+fn recent_hook_log_identity(path: &Path) -> Option<Value> {
+    let body = fs::read_to_string(path).ok()?;
+    body.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(build_identity_fields_from_value)
+}
+
+fn build_identity_fields_from_value(value: Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let version = identity_string_field(object, "version")?;
+    let git_commit = identity_string_or_null_field(object, "git_commit")?;
+    let git_commit_short = identity_string_or_null_field(object, "git_commit_short")?;
+    let build_time = identity_string_or_null_field(object, "build_time")?;
+    let dirty = object.get("dirty")?.as_bool()?;
+    Some(json!({
+        "version": version,
+        "git_commit": git_commit,
+        "git_commit_short": git_commit_short,
+        "build_time": build_time,
+        "dirty": dirty
+    }))
+}
+
+fn identity_string_field(object: &Map<String, Value>, key: &str) -> Option<Value> {
+    match object.get(key)? {
+        Value::String(_) => object.get(key).cloned(),
+        _ => None,
+    }
+}
+
+fn identity_string_or_null_field(object: &Map<String, Value>, key: &str) -> Option<Value> {
+    match object.get(key)? {
+        Value::String(_) | Value::Null => object.get(key).cloned(),
+        _ => None,
+    }
+}
+
+fn adjacent_hook_sidecar_identity() -> Value {
+    let hook_path = match std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("token-fire-hook")))
+    {
+        Some(path) if path.exists() => path,
+        _ => {
+            return json!({
+                "status": "unavailable",
+                "error_kind": "hook_executable_not_found"
+            })
+        }
+    };
+
+    match std::process::Command::new(&hook_path)
+        .arg("--version-json")
+        .output()
+    {
+        Ok(output) if output.status.success() => serde_json::from_slice::<Value>(&output.stdout)
+            .ok()
+            .and_then(build_identity_fields_from_value)
+            .unwrap_or_else(
+                || json!({ "status": "unavailable", "error_kind": "invalid_version_json" }),
+            ),
+        Ok(output) => {
+            json!({ "status": "unavailable", "error_kind": format!("exit_status_{}", output.status) })
+        }
+        Err(error) => json!({
+            "status": "unavailable",
+            "error_kind": format!("io_{:?}", error.kind()).to_lowercase()
+        }),
+    }
+}
+
+fn build_identity_diagnostic(hook_log_path: &Path) -> Value {
+    let app_runtime = serde_json::to_value(current_build_identity()).unwrap_or_else(|_| json!({}));
+    let hook_sidecar = hook_sidecar_identity(hook_log_path);
+    let mismatch = match (
+        app_runtime.get("git_commit").and_then(Value::as_str),
+        hook_sidecar.get("git_commit").and_then(Value::as_str),
+    ) {
+        (Some(app_commit), Some(hook_commit)) => Value::Bool(app_commit != hook_commit),
+        _ => Value::Null,
+    };
+    json!({
+        "app_runtime": app_runtime,
+        "hook_sidecar": hook_sidecar,
+        "mismatch": mismatch
+    })
 }
 
 fn read_redacted_events(path: &Path, strict_privacy: bool) -> Vec<Value> {
@@ -167,6 +265,9 @@ fn redact_object(object: Map<String, Value>, strict_privacy: bool) -> Map<String
             "source_path" => {
                 redacted.insert(key, redact_source_path(value, strict_privacy));
             }
+            "hook_path" => {
+                redacted.insert(key, redact_hook_path_value(value));
+            }
             _ => {
                 redacted.insert(key, redact_value(value, strict_privacy));
             }
@@ -186,6 +287,23 @@ fn redact_value(value: Value, strict_privacy: bool) -> Value {
         ),
         Value::Object(object) => Value::Object(redact_object(object, strict_privacy)),
         scalar => scalar,
+    }
+}
+
+fn redact_hook_path_value(value: Value) -> Value {
+    let Some(path) = value.as_str() else {
+        return redact_value(value, true);
+    };
+    Value::String(redact_hook_path(path))
+}
+
+fn redact_hook_path(value: &str) -> String {
+    if value.contains("/Applications/TokenFire.app/") {
+        "applications_bundle/token-fire-hook".to_string()
+    } else if value.ends_with("token-fire-hook") {
+        "dev_target/token-fire-hook".to_string()
+    } else {
+        "unknown/token-fire-hook".to_string()
     }
 }
 

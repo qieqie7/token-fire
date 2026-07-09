@@ -3,26 +3,36 @@ use std::path::PathBuf;
 
 use serde_json::json;
 use token_fire::adapters::traex::hook_payload::filter_hook_payload_with_source;
+use token_fire::app::build_identity::{
+    current_build_identity, fields_with_build_identity, has_version_json_arg, print_version_json,
+};
 use token_fire::app::logging::append_hook_log;
 use token_fire::app::paths::{runtime_paths, RuntimePaths};
 use token_fire::app::socket_server::forward_hook_metadata;
 
 fn main() {
-    if let Err(error) = run() {
+    let identity = current_build_identity();
+    if has_version_json_arg() {
+        let _ = print_version_json(&identity);
+        std::process::exit(0);
+    }
+
+    if let Err(error) = run(identity) {
         let paths = paths_from_env().or_else(|_| runtime_paths());
         if let Ok(paths) = paths {
+            let identity = current_build_identity();
             let _ = append_hook_log(
                 &paths,
                 "warn",
                 "hook_internal_failure",
-                json!({ "error_kind": error.to_string() }),
+                fields_with_build_identity(json!({ "error_kind": error.to_string() }), &identity),
             );
         }
     }
     std::process::exit(0);
 }
 
-fn run() -> anyhow::Result<()> {
+fn run(identity: token_fire::app::build_identity::BuildIdentity) -> anyhow::Result<()> {
     let paths = paths_from_env().or_else(|_| runtime_paths())?;
     let mut stdin = String::new();
     std::io::stdin().read_to_string(&mut stdin)?;
@@ -33,7 +43,7 @@ fn run() -> anyhow::Result<()> {
                 &paths,
                 "warn",
                 "hook_malformed_payload",
-                json!({ "error_kind": error.to_string() }),
+                fields_with_build_identity(json!({ "error_kind": error.to_string() }), &identity),
             )?;
             return Ok(());
         }
@@ -49,18 +59,21 @@ fn run() -> anyhow::Result<()> {
             &paths,
             "info",
             "hook_forwarded",
-            json!({
-                "source": metadata.source,
-                "hook_path": current_hook_path()
-                    .map(|path| path.to_string_lossy().to_string())
-                    .ok()
-            }),
+            fields_with_build_identity(
+                json!({
+                    "source": metadata.source,
+                    "hook_path": current_hook_path()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .ok()
+                }),
+                &identity,
+            ),
         )?,
         Err(error) => append_hook_log(
             &paths,
             "warn",
             "hook_socket_unavailable",
-            json!({ "error_kind": error.to_string() }),
+            fields_with_build_identity(json!({ "error_kind": error.to_string() }), &identity),
         )?,
     }
     Ok(())

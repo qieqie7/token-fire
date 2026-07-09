@@ -463,6 +463,26 @@ fn smoke_scripts_build_sidecar_before_requiring_external_bin() {
 }
 
 #[test]
+fn smoke_scripts_run_version_guard_before_builds() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let app_smoke =
+        fs::read_to_string(manifest_dir.join("../scripts/app-bundle-smoke.sh")).unwrap();
+    let release_smoke =
+        fs::read_to_string(manifest_dir.join("../scripts/release-smoke.sh")).unwrap();
+
+    for script in [&app_smoke, &release_smoke] {
+        let guard_index = script.find("pnpm release:check-version").unwrap();
+        let cargo_build_index = script.find("cargo build").unwrap();
+        let pnpm_build_index = script.find("pnpm build").unwrap();
+        let tauri_build_index = script.find("pnpm tauri build").unwrap();
+
+        assert!(guard_index < cargo_build_index);
+        assert!(guard_index < pnpm_build_index);
+        assert!(guard_index < tauri_build_index);
+    }
+}
+
+#[test]
 fn tray_refresh_fallback_interval_is_low_frequency() {
     assert_eq!(TRAY_REFRESH_FALLBACK_INTERVAL, StdDuration::from_secs(300));
     assert_ne!(TRAY_REFRESH_FALLBACK_INTERVAL, StdDuration::from_secs(1));

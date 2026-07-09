@@ -22,11 +22,29 @@
   gap: 12px;
 }
 
+.profile-header {
+  min-width: 0;
+}
+
 .profile-brand {
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   gap: 8px;
   font-weight: 760;
+}
+
+.profile-version {
+  min-width: 0;
+  max-width: 190px;
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-family: var(--font-family-mono);
+  font-size: 10px;
+  line-height: 1;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .profile-brand__flame {

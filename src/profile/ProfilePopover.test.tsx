@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { ProfilePopover } from "./ProfilePopover";
-import type { ProfileSummary } from "./types";
+import type { BuildIdentity, ProfileSummary } from "./types";
 
 const days = Array.from({ length: 365 }, (_, index) => ({
   local_date: `2026-01-${String((index % 28) + 1).padStart(2, "0")}`,
@@ -54,6 +54,14 @@ const summary: ProfileSummary = {
   },
 };
 
+const buildIdentity: BuildIdentity = {
+  version: "0.1.1",
+  git_commit: "7e17eb0abcdef",
+  git_commit_short: "7e17eb0",
+  build_time: "unix:123",
+  dirty: false,
+};
+
 describe("ProfilePopover", () => {
   it("renders fixed yearly profile above selected-period analytics", () => {
     const html = renderToStaticMarkup(
@@ -62,6 +70,7 @@ describe("ProfilePopover", () => {
         summary={summary}
         loading={false}
         error={false}
+        buildIdentity={buildIdentity}
         onPeriodChange={() => {}}
       />,
     );
@@ -106,6 +115,7 @@ describe("ProfilePopover", () => {
         summary={null}
         loading={false}
         error={true}
+        buildIdentity={null}
         onPeriodChange={() => {}}
       />,
     );
@@ -125,6 +135,7 @@ describe("ProfilePopover", () => {
         summary={null}
         loading={false}
         error={true}
+        buildIdentity={null}
         onPeriodChange={() => {}}
       />,
     );
@@ -132,5 +143,39 @@ describe("ProfilePopover", () => {
     expect(html).toContain("过去 365 天");
     expect(html).toContain("活跃 0 天");
     expect(html).not.toContain("峰值周");
+  });
+
+  it("renders compact build identity in the header", () => {
+    const html = renderToStaticMarkup(
+      <ProfilePopover
+        period="this_month"
+        summary={summary}
+        loading={false}
+        error={false}
+        buildIdentity={buildIdentity}
+        onPeriodChange={() => {}}
+      />,
+    );
+
+    expect(html).toContain("v0.1.1 · 7e17eb0");
+    expect(html.indexOf("TokenFire")).toBeLessThan(html.indexOf("v0.1.1"));
+    expect(html).not.toContain("unix:123");
+    expect(html).not.toContain("7e17eb0abcdef");
+  });
+
+  it("marks dirty builds without showing build time", () => {
+    const html = renderToStaticMarkup(
+      <ProfilePopover
+        period="this_month"
+        summary={summary}
+        loading={false}
+        error={false}
+        buildIdentity={{ ...buildIdentity, dirty: true }}
+        onPeriodChange={() => {}}
+      />,
+    );
+
+    expect(html).toContain("v0.1.1 · 7e17eb0 · dirty");
+    expect(html).not.toContain("unix:123");
   });
 });

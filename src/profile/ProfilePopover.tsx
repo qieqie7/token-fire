@@ -1,4 +1,4 @@
-import type { ProfilePeriod, ProfileSummary } from "./types";
+import type { BuildIdentity, ProfilePeriod, ProfileSummary } from "./types";
 import { AppSources } from "./AppSources";
 import { MetricPair } from "./MetricPair";
 import { PeriodFilter } from "./PeriodFilter";
@@ -11,7 +11,15 @@ export interface ProfilePopoverProps {
   summary: ProfileSummary | null;
   loading: boolean;
   error: boolean;
+  buildIdentity: BuildIdentity | null;
   onPeriodChange: (period: ProfilePeriod) => void;
+}
+
+export function formatBuildIdentityLabel(identity: BuildIdentity): string {
+  const parts = [`v${identity.version}`];
+  if (identity.git_commit_short) parts.push(identity.git_commit_short);
+  if (identity.dirty) parts.push("dirty");
+  return parts.join(" · ");
 }
 
 export function ProfilePopover({
@@ -19,10 +27,12 @@ export function ProfilePopover({
   summary,
   loading,
   error,
+  buildIdentity,
   onPeriodChange,
 }: ProfilePopoverProps) {
   const year = summary?.year_profile ?? null;
   const selectedPeriod = summary?.selected_period ?? null;
+  const buildIdentityLabel = buildIdentity ? formatBuildIdentityLabel(buildIdentity) : null;
 
   return (
     <main className="profile-popover">
@@ -31,6 +41,11 @@ export function ProfilePopover({
           <span className="profile-brand__flame" />
           <span>TokenFire</span>
         </div>
+        {buildIdentityLabel ? (
+          <span className="profile-version" title={`TokenFire ${buildIdentityLabel}`}>
+            {buildIdentityLabel}
+          </span>
+        ) : null}
       </header>
 
       {year ? (

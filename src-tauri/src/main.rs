@@ -8,6 +8,10 @@ use token_fire::adapters::codex::status::CodexStatusSource;
 use token_fire::adapters::traex::hook_config::default_config_path;
 use token_fire::adapters::traex::resolver::TraexPaths;
 use token_fire::adapters::traex::status::TraexStatusSource;
+use token_fire::app::build_identity::{
+    current_build_identity, has_version_json_arg, log_app_started, print_version_json,
+    BuildIdentity,
+};
 use token_fire::app::logging::DebugLogGate;
 use token_fire::app::paths::runtime_paths;
 use token_fire::app::runtime::start_app_runtime_for_state_with_widget_events;
@@ -30,8 +34,20 @@ fn profile_summary(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn build_identity() -> BuildIdentity {
+    current_build_identity()
+}
+
 fn main() {
+    let build_identity_value = current_build_identity();
+    if has_version_json_arg() {
+        print_version_json(&build_identity_value).expect("failed to print TokenFire version JSON");
+        return;
+    }
+
     let paths = runtime_paths().expect("runtime paths");
+    let _ = log_app_started(&paths, &build_identity_value);
     let traex_paths = TraexPaths::default_for_home().expect("Traex paths");
     let tracking_gate = TrackingGate::new();
     let debug_gate = DebugLogGate::default();
@@ -72,7 +88,7 @@ fn main() {
 
     tauri::Builder::default()
         .manage(app_state)
-        .invoke_handler(tauri::generate_handler![profile_summary])
+        .invoke_handler(tauri::generate_handler![profile_summary, build_identity])
         .setup(move |app| {
             install_tray(app.handle())?;
             let refresh_handle = start_tray_refresh_loop(app.handle().clone());

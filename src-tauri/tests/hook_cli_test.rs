@@ -258,3 +258,68 @@ fn hook_cli_accepts_claude_source_without_content() {
     assert!(!forwarded.contains("SENTINEL_TOOL_INPUT"));
     assert!(!forwarded.contains("prompt"));
 }
+
+#[test]
+fn hook_binary_prints_version_json_without_reading_stdin() {
+    let mut cmd = Command::cargo_bin("token-fire-hook").unwrap();
+
+    let output = cmd
+        .arg("--version-json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    assert!(value.get("dirty").is_some());
+    assert!(value.get("build_time").is_some());
+}
+
+#[test]
+fn hook_forwarded_log_includes_build_identity() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("token-fire.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut body = String::new();
+        stream.read_to_string(&mut body).unwrap();
+    });
+
+    let mut cmd = Command::cargo_bin("token-fire-hook").unwrap();
+    cmd.env("TOKEN_FIRE_SOCKET", &socket_path)
+        .env("TOKEN_FIRE_HOME", dir.path())
+        .write_stdin(r#"{"source":"cursor","hook_event_name":"stop"}"#)
+        .assert()
+        .success();
+    handle.join().unwrap();
+
+    let hook_log = std::fs::read_to_string(dir.path().join("logs").join("hook.log")).unwrap();
+    let event: serde_json::Value = serde_json::from_str(hook_log.lines().next().unwrap()).unwrap();
+    assert_eq!(event["event"], "hook_forwarded");
+    assert_eq!(event["version"], env!("CARGO_PKG_VERSION"));
+    assert!(event.get("dirty").is_some());
+    assert!(event.get("build_time").is_some());
+}
+
+#[test]
+fn hook_socket_unavailable_log_includes_build_identity() {
+    let dir = tempdir().unwrap();
+    let missing_socket = dir.path().join("missing.sock");
+
+    let mut cmd = Command::cargo_bin("token-fire-hook").unwrap();
+    cmd.env("TOKEN_FIRE_SOCKET", &missing_socket)
+        .env("TOKEN_FIRE_HOME", dir.path())
+        .write_stdin(r#"{"source":"cursor","hook_event_name":"stop"}"#)
+        .assert()
+        .success();
+
+    let hook_log = std::fs::read_to_string(dir.path().join("logs").join("hook.log")).unwrap();
+    let event: serde_json::Value = serde_json::from_str(hook_log.lines().next().unwrap()).unwrap();
+    assert_eq!(event["event"], "hook_socket_unavailable");
+    assert_eq!(event["version"], env!("CARGO_PKG_VERSION"));
+    assert!(event.get("dirty").is_some());
+    assert!(event.get("build_time").is_some());
+}

@@ -7,7 +7,12 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "test": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "release:check-version": "node scripts/check-version-consistency.mjs",
+    "release:build-identity-env": "node scripts/build-identity-env.mjs",
+    "release:bump": "node scripts/bump-version.mjs",
+    "test:build-identity-env": "node --test scripts/build-identity-env.test.mjs",
+    "test:version-scripts": "node --test scripts/version-utils.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

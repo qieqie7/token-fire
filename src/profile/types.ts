@@ -1,5 +1,13 @@
 export type ProfilePeriod = "today" | "this_week" | "this_month" | "this_year";
 
+export interface BuildIdentity {
+  version: string;
+  git_commit: string | null;
+  git_commit_short: string | null;
+  build_time: string | null;
+  dirty: boolean;
+}
+
 export interface ProfileSummary {
   generated_at: string;
   currency: "CNY";

@@ -1,3 +1,4 @@
+pub mod build_identity;
 pub mod debug_bundle;
 pub mod floating_widget;
 pub mod hook_intake;

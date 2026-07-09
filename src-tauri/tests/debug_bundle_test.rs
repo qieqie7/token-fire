@@ -103,6 +103,91 @@ fn debug_bundle_redacts_paths_and_excludes_raw_content() {
 }
 
 #[test]
+fn debug_bundle_includes_app_and_hook_build_identity_section() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path());
+
+    let bundle_path = create_debug_bundle(&paths, true).unwrap();
+    let body = fs::read_to_string(bundle_path).unwrap();
+    let bundle: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(
+        bundle["build_identity"]["app_runtime"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(bundle["build_identity"]["app_runtime"]
+        .get("dirty")
+        .is_some());
+    assert!(bundle["build_identity"]["app_runtime"]
+        .get("build_time")
+        .is_some());
+    assert!(bundle["build_identity"].get("hook_sidecar").is_some());
+    assert!(bundle["build_identity"].get("mismatch").is_some());
+}
+
+#[test]
+fn debug_bundle_prefers_recent_hook_log_build_identity_for_mismatch() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path());
+    fs::create_dir_all(paths.hook_log.parent().unwrap()).unwrap();
+    write_jsonl_event(
+        &paths.hook_log,
+        "hook",
+        "info",
+        "hook_forwarded",
+        json!({
+            "source": "traex",
+            "hook_path": "/Users/example/dev/token-fire/src-tauri/target/release/token-fire-hook",
+            "version": "0.1.0",
+            "git_commit": "stale-hook-commit",
+            "git_commit_short": "stale-h",
+            "build_time": "unix:1",
+            "dirty": false
+        }),
+    )
+    .unwrap();
+
+    let bundle_path = create_debug_bundle(&paths, true).unwrap();
+    let body = fs::read_to_string(bundle_path).unwrap();
+    let bundle: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(
+        bundle["build_identity"]["hook_sidecar"]["git_commit"],
+        "stale-hook-commit"
+    );
+    assert_eq!(
+        bundle["build_identity"]["hook_sidecar"]["git_commit_short"],
+        "stale-h"
+    );
+    assert_eq!(
+        bundle["build_identity"]["hook_sidecar"]["build_time"],
+        "unix:1"
+    );
+    assert_eq!(bundle["build_identity"]["hook_sidecar"]["dirty"], false);
+    assert_eq!(bundle["build_identity"]["mismatch"], true);
+    assert!(!body.contains("/Users/example/dev/token-fire"));
+    assert!(body.contains("dev_target/token-fire-hook"));
+}
+
+#[test]
+fn debug_bundle_redacts_hook_path() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path());
+    fs::create_dir_all(paths.hook_log.parent().unwrap()).unwrap();
+    fs::write(
+        &paths.hook_log,
+        r#"{"event":"hook_forwarded","hook_path":"/Users/example/dev/token-fire/src-tauri/target/release/token-fire-hook","version":"0.1.0"}"#,
+    )
+    .unwrap();
+
+    let bundle_path = create_debug_bundle(&paths, true).unwrap();
+    let body = fs::read_to_string(bundle_path).unwrap();
+
+    assert!(!body.contains("/Users/example/dev/token-fire"));
+    assert!(body.contains("dev_target/token-fire-hook"));
+}
+
+#[test]
 fn jsonl_writer_drops_forbidden_fields_and_preserves_reserved_fields() {
     let dir = tempdir().unwrap();
     let paths = paths(dir.path());
