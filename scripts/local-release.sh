@@ -16,16 +16,6 @@ require_dir() {
   [[ -d "$path" ]] || fail "缺少必要目录：$path"
 }
 
-require_executable() {
-  local path="$1"
-  [[ -x "$path" ]] || fail "缺少可执行文件：$path"
-}
-
-require_non_empty_file() {
-  local path="$1"
-  [[ -s "$path" ]] || fail "文件不存在或为空：$path"
-}
-
 echo "==> 检查仓库结构"
 require_file "package.json"
 require_file "src-tauri/tauri.conf.json"
@@ -46,59 +36,12 @@ git check-ignore -q "${release_dir}/" || fail "生成发布资产前，${release
 echo "==> 检查版本一致性"
 pnpm release:check-version
 
-echo "==> 准备 build identity"
 version="$(node -e 'const fs = require("fs"); console.log(JSON.parse(fs.readFileSync("package.json", "utf8")).version)')"
-eval "$(pnpm --silent release:build-identity-env)"
-export TOKEN_FIRE_GIT_COMMIT TOKEN_FIRE_GIT_COMMIT_SHORT TOKEN_FIRE_GIT_DIRTY TOKEN_FIRE_BUILD_TIME
 
-echo "==> 准备 dist-app/"
-rm -rf "$release_dir"
-mkdir -p "$release_dir"
+echo "==> 运行完整 release pipeline"
+scripts/release-pipeline.sh --bundle dmg --clean-required
 
-echo "==> 构建 token-fire-hook sidecar"
-host_triple="$(rustc -vV | sed -n 's/^host: //p')"
-[[ -n "$host_triple" ]] || fail "无法读取 Rust host triple"
-
-TAURI_CONFIG='{"bundle":{"externalBin":[]}}' cargo build --manifest-path src-tauri/Cargo.toml --bin token-fire-hook --release
-mkdir -p src-tauri/bin
-cp "src-tauri/target/release/token-fire-hook" "src-tauri/bin/token-fire-hook-${host_triple}"
-chmod +x "src-tauri/bin/token-fire-hook-${host_triple}"
-
-echo "==> 运行 Rust 测试"
-cargo test --manifest-path src-tauri/Cargo.toml
-
-echo "==> 运行前端测试"
-pnpm test
-
-echo "==> 构建前端"
-pnpm build
-
-echo "==> 构建 Tauri release bundle"
-pnpm tauri build
-
-app_path="src-tauri/target/release/bundle/macos/TokenFire.app"
-app_bin_path="src-tauri/target/release/bundle/macos/TokenFire.app/Contents/MacOS/token-fire"
-app_hook_path="src-tauri/target/release/bundle/macos/TokenFire.app/Contents/MacOS/token-fire-hook"
-app_tray_icon_path="src-tauri/target/release/bundle/macos/TokenFire.app/Contents/Resources/icons/tray-icon.png"
 dmg_dir="src-tauri/target/release/bundle/dmg"
-identity_dir="$(mktemp -d)"
-
-echo "==> 检查 app bundle"
-require_dir "$app_path"
-require_executable "$app_bin_path"
-require_executable "$app_hook_path"
-require_non_empty_file "$app_tray_icon_path"
-
-echo "==> 检查 build identity"
-"${app_bin_path}" --version-json > "${identity_dir}/app.json"
-"${app_hook_path}" --version-json > "${identity_dir}/hook.json"
-node scripts/check-build-identity-output.mjs \
-  "${identity_dir}/app.json" \
-  "${identity_dir}/hook.json" \
-  "${version}" \
-  "${TOKEN_FIRE_GIT_COMMIT}" \
-  "${TOKEN_FIRE_GIT_COMMIT_SHORT}" \
-  "${TOKEN_FIRE_GIT_DIRTY}"
 
 echo "==> 查找 DMG"
 require_dir "$dmg_dir"

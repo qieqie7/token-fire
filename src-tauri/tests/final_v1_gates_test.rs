@@ -442,58 +442,47 @@ fn tray_title_and_menu_labels_cover_v1_ui_surface() {
 }
 
 #[test]
-fn app_bundle_smoke_checks_packaged_tray_icon_resource() {
+fn release_pipeline_checks_packaged_tray_icon_resource() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let smoke = fs::read_to_string(manifest_dir.join("../scripts/app-bundle-smoke.sh")).unwrap();
+    let pipeline = fs::read_to_string(manifest_dir.join("../scripts/release-pipeline.sh")).unwrap();
 
-    assert!(smoke.contains("Contents/Resources/icons/tray-icon.png"));
+    assert!(pipeline.contains("Contents/Resources/icons/tray-icon.png"));
 }
 
 #[test]
-fn smoke_scripts_build_sidecar_before_requiring_external_bin() {
+fn release_pipeline_builds_sidecar_before_requiring_external_bin() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_smoke =
-        fs::read_to_string(manifest_dir.join("../scripts/app-bundle-smoke.sh")).unwrap();
-    let release_smoke =
-        fs::read_to_string(manifest_dir.join("../scripts/release-smoke.sh")).unwrap();
+    let pipeline = fs::read_to_string(manifest_dir.join("../scripts/release-pipeline.sh")).unwrap();
     let external_bin_override = r#"TAURI_CONFIG='{"bundle":{"externalBin":[]}}' cargo build"#;
 
-    assert!(app_smoke.contains(external_bin_override));
-    assert!(release_smoke.contains(external_bin_override));
+    assert!(pipeline.contains(external_bin_override));
 }
 
 #[test]
-fn smoke_scripts_run_version_guard_before_builds() {
+fn release_pipeline_runs_version_guard_before_builds() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_smoke =
-        fs::read_to_string(manifest_dir.join("../scripts/app-bundle-smoke.sh")).unwrap();
-    let release_smoke =
-        fs::read_to_string(manifest_dir.join("../scripts/release-smoke.sh")).unwrap();
+    let pipeline = fs::read_to_string(manifest_dir.join("../scripts/release-pipeline.sh")).unwrap();
+    let guard_index = pipeline.find("pnpm release:check-version").unwrap();
+    let cargo_build_index = pipeline.find("cargo build").unwrap();
+    let pnpm_build_index = pipeline.find("pnpm build").unwrap();
+    let tauri_build_index = pipeline.find("pnpm tauri build").unwrap();
 
-    for script in [&app_smoke, &release_smoke] {
-        let guard_index = script.find("pnpm release:check-version").unwrap();
-        let cargo_build_index = script.find("cargo build").unwrap();
-        let pnpm_build_index = script.find("pnpm build").unwrap();
-        let tauri_build_index = script.find("pnpm tauri build").unwrap();
-
-        assert!(guard_index < cargo_build_index);
-        assert!(guard_index < pnpm_build_index);
-        assert!(guard_index < tauri_build_index);
-    }
+    assert!(guard_index < cargo_build_index);
+    assert!(guard_index < pnpm_build_index);
+    assert!(guard_index < tauri_build_index);
 }
 
 #[test]
-fn local_release_script_exists_and_builds_full_dmg_bundle() {
+fn local_release_script_uses_full_dmg_pipeline() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let script_path = manifest_dir.join("../scripts/local-release.sh");
     let script = fs::read_to_string(&script_path).unwrap();
 
-    assert!(script.contains("pnpm tauri build"));
-    assert!(!script.contains("pnpm tauri build --bundles app"));
+    assert!(script.contains("scripts/release-pipeline.sh --bundle dmg --clean-required"));
+    assert!(!script.contains("cargo build"));
+    assert!(!script.contains("pnpm test"));
+    assert!(!script.contains("\npnpm tauri build"));
     assert!(script.contains("src-tauri/target/release/bundle/dmg"));
-    assert!(script.contains("TokenFire.app/Contents/MacOS/token-fire"));
-    assert!(script.contains("TokenFire.app/Contents/MacOS/token-fire-hook"));
-    assert!(script.contains("TokenFire.app/Contents/Resources/icons/tray-icon.png"));
 }
 
 #[test]
@@ -520,32 +509,34 @@ fn local_release_script_cleans_frontend_dist_before_copying_release_assets() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = fs::read_to_string(manifest_dir.join("../scripts/local-release.sh")).unwrap();
 
-    let tauri_build = script.find("pnpm tauri build").unwrap();
-    let cleanup = script.find("==> 清理 dist-app 发布目录").expect(
-        "local release script should clean dist-app after Tauri build completes",
-    );
+    let release_pipeline = script
+        .find("scripts/release-pipeline.sh --bundle dmg --clean-required")
+        .unwrap();
+    let cleanup = script
+        .find("==> 清理 dist-app 发布目录")
+        .expect("local release script should clean dist-app after release pipeline completes");
     let copy_assets = script.find("==> 复制发布资产").unwrap();
 
-    assert!(tauri_build < cleanup);
+    assert!(release_pipeline < cleanup);
     assert!(cleanup < copy_assets);
     assert!(script[cleanup..copy_assets].contains("rm -rf \"$release_dir\""));
     assert!(script[cleanup..copy_assets].contains("mkdir -p \"$release_dir\""));
 }
 
 #[test]
-fn local_release_script_uses_shared_release_identity_checks() {
+fn release_pipeline_uses_shared_release_identity_checks() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let script = fs::read_to_string(manifest_dir.join("../scripts/local-release.sh")).unwrap();
+    let pipeline = fs::read_to_string(manifest_dir.join("../scripts/release-pipeline.sh")).unwrap();
 
-    let version_guard = script.find("pnpm release:check-version").unwrap();
-    let build_identity_env = script
+    let version_guard = pipeline.find("pnpm release:check-version").unwrap();
+    let build_identity_env = pipeline
         .find("pnpm --silent release:build-identity-env")
         .unwrap();
-    let cargo_build = script.find("cargo build").unwrap();
-    let pnpm_build = script.find("pnpm build").unwrap();
-    let tauri_build = script.find("pnpm tauri build").unwrap();
+    let cargo_build = pipeline.find("cargo build").unwrap();
+    let pnpm_build = pipeline.find("pnpm build").unwrap();
+    let tauri_build = pipeline.find("pnpm tauri build").unwrap();
 
-    assert!(script.contains(
+    assert!(pipeline.contains(
         "export TOKEN_FIRE_GIT_COMMIT TOKEN_FIRE_GIT_COMMIT_SHORT TOKEN_FIRE_GIT_DIRTY TOKEN_FIRE_BUILD_TIME"
     ));
     assert!(version_guard < cargo_build);
@@ -554,12 +545,60 @@ fn local_release_script_uses_shared_release_identity_checks() {
     assert!(build_identity_env < cargo_build);
     assert!(build_identity_env < pnpm_build);
     assert!(build_identity_env < tauri_build);
-    assert!(script.contains("\"${app_bin_path}\" --version-json"));
-    assert!(script.contains("\"${app_hook_path}\" --version-json"));
-    assert!(script.contains("node scripts/check-build-identity-output.mjs"));
-    assert!(script.contains("\"${TOKEN_FIRE_GIT_COMMIT}\""));
-    assert!(!script.contains("extract_json_string"));
-    assert!(!script.contains("extract_cargo_version"));
+    assert!(pipeline.contains("\"${app_bin_path}\" --version-json"));
+    assert!(pipeline.contains("\"${app_hook_path}\" --version-json"));
+    assert!(pipeline.contains("node scripts/check-build-identity-output.mjs"));
+    assert!(pipeline.contains("\"${TOKEN_FIRE_GIT_COMMIT}\""));
+    assert!(!pipeline.contains("extract_json_string"));
+    assert!(!pipeline.contains("extract_cargo_version"));
+}
+
+#[test]
+fn release_pipeline_dmg_mode_checks_exactly_one_dmg_artifact() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let pipeline = fs::read_to_string(manifest_dir.join("../scripts/release-pipeline.sh")).unwrap();
+
+    assert!(pipeline.contains("dmg_dir=\"src-tauri/target/release/bundle/dmg\""));
+    assert!(pipeline.contains("find \"${dmg_dir}\" -maxdepth 1 -type f -name \"*.dmg\""));
+    assert!(pipeline.contains("if [ \"${bundle}\" = \"dmg\" ]; then"));
+    assert!(pipeline.contains("if [[ \"${#dmgs[@]}\" -eq 0 ]]; then"));
+    assert!(pipeline.contains("if [[ \"${#dmgs[@]}\" -gt 1 ]]; then"));
+}
+
+#[test]
+fn legacy_smoke_script_entrypoints_are_removed_from_docs_and_skills() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir.parent().unwrap();
+    let legacy_app_smoke = ["app-bundle", "-smoke.sh"].concat();
+    let legacy_release_smoke = ["release", "-smoke.sh"].concat();
+    let checked_paths = [
+        "AGENTS.md",
+        "README.md",
+        "agent-docs/release-versioning.md",
+        ".agents/skills/release-version-build/SKILL.md",
+    ];
+
+    assert!(!repo_root.join("scripts").join(&legacy_app_smoke).exists());
+    assert!(!repo_root
+        .join("scripts")
+        .join(&legacy_release_smoke)
+        .exists());
+
+    for path in checked_paths {
+        let body = fs::read_to_string(repo_root.join(path)).unwrap();
+        assert!(
+            !body.contains(&legacy_app_smoke),
+            "{path} still references removed app smoke script"
+        );
+        assert!(
+            !body.contains(&legacy_release_smoke),
+            "{path} still references removed release smoke script"
+        );
+        assert!(
+            body.contains("scripts/release-pipeline.sh"),
+            "{path} should reference scripts/release-pipeline.sh"
+        );
+    }
 }
 
 #[test]

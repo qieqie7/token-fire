@@ -70,16 +70,16 @@ cargo test --manifest-path src-tauri/Cargo.toml
 应用 bundle smoke 检查：
 
 ```bash
-scripts/app-bundle-smoke.sh
+scripts/release-pipeline.sh --bundle app --allow-dirty
 ```
 
 完整 release smoke 检查：
 
 ```bash
-scripts/release-smoke.sh
+scripts/release-pipeline.sh --bundle dmg --clean-required
 ```
 
-`scripts/app-bundle-smoke.sh` 只构建 `.app` bundle。`scripts/release-smoke.sh` 会执行完整 Tauri build，用于检查 release 构建链路。
+`scripts/release-pipeline.sh --bundle app --allow-dirty` 只构建 `.app` bundle。`scripts/release-pipeline.sh --bundle dmg --clean-required` 会执行完整 Tauri build，用于检查 release 构建链路，并默认拒绝 dirty build。
 
 ## 本地发布
 

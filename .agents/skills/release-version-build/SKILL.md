@@ -7,7 +7,7 @@ description: 当准备发布版本升级，并且需要打 tag、推送、完成
 
 ## 概览
 
-按发布顺序执行：确认目标版本，升级版本元数据，验证一致性，提交，打 tag，推送，然后完成构建。
+按发布顺序执行：确认目标版本，升级版本元数据，验证一致性，提交，打 tag，推送，然后完成完整发布构建。
 
 如果用户没有提供目标版本，修改文件前必须停止。根据 SemVer 语义给出建议版本，并等待用户确认。
 
@@ -31,7 +31,7 @@ description: 当准备发布版本升级，并且需要打 tag、推送、完成
 5. 提交版本升级。
 6. 为目标版本创建 annotated git tag。
 7. 推送 commit 和 tag。
-8. 完成要求的构建。
+8. 完成要求的完整发布构建。
 9. 汇报准确的 commit、tag、push、build 证据。
 
 版本一致性检查通过前不要打 tag。构建成功前不要宣称完成。
@@ -68,10 +68,20 @@ rtk git commit -m "chore: release 0.1.1"
 rtk git tag -a v0.1.1 -m "v0.1.1"
 rtk git push
 rtk git push origin v0.1.1
-rtk bash scripts/app-bundle-smoke.sh
+rtk bash scripts/release-pipeline.sh --bundle dmg --clean-required
 ```
 
 替换示例里的版本号。只有 baseline release 文案需要同步时，才把 `agent-docs/release-versioning.md` 加入提交。
+
+`scripts/release-pipeline.sh --bundle app --allow-dirty` 只验证 `.app` bundle，不产出 DMG。用户要求“打包的 DMG 文件”或完整发布构建时，必须使用 `scripts/release-pipeline.sh --bundle dmg --clean-required`，并确认 `src-tauri/target/release/bundle/dmg/` 下存在目标 DMG。
+
+如果 `git tag -a vX.Y.Z` 失败并提示 tag already exists：
+
+1. 停止发布流程。
+2. 检查本地 tag 指向：`rtk git rev-parse vX.Y.Z^{}`。
+3. 检查远端 tag：`rtk git ls-remote origin refs/tags/vX.Y.Z refs/tags/vX.Y.Z^{}`。
+4. 向用户说明 tag 指向的 commit 和当前 release commit。
+5. 不要删除、覆盖、force push tag，除非用户明确要求。
 
 ## 通用仓库适配
 
@@ -95,8 +105,11 @@ rtk bash scripts/app-bundle-smoke.sh
 - tag 名称
 - commit 和 tag 的 push 结果
 - 构建命令和通过/失败结果
+- DMG 产物路径和文件名；如果只生成 `.app` 或 `.zip`，说明未完成 DMG 发布构建
 
 如果 tag 推送后构建失败，必须说明 tag 已推送，并给出失败命令和错误。除非用户明确要求，不要改写或删除 tag。
+
+如果执行过程中发现 skill 流程不符合实际仓库行为，先修正 skill，再继续发布流程。
 
 ## 常见错误
 
@@ -105,5 +118,7 @@ rtk bash scripts/app-bundle-smoke.sh
 | 用户没给版本，agent 直接升级 | 先建议版本并等待确认 |
 | 检查通过前打 tag | commit/tag 前先跑版本一致性检查 |
 | 推了 tag 但跳过构建 | 构建是完成标准的一部分 |
+| 用 `--bundle app` 当完整发布构建 | 改用 `scripts/release-pipeline.sh --bundle dmg --clean-required`，并确认 DMG 产物 |
+| tag 已存在还继续发布 | 停止，查本地和远端 tag 指向，等待用户决策 |
 | push 后构建失败 | 清楚报告部分发布状态；破坏性清理前先问用户 |
 | 存在无关 dirty 文件 | 不纳入无关变更；若阻塞干净 release commit，先询问用户 |

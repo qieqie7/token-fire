@@ -67,7 +67,7 @@ TOKEN_FIRE_GIT_DIRTY=...
 TOKEN_FIRE_BUILD_TIME=...
 ```
 
-`scripts/app-bundle-smoke.sh` 和 `scripts/release-smoke.sh` 应消费这些 assignments，再把 build identity 注入 app runtime 和 hook sidecar build。
+`scripts/release-pipeline.sh` 应消费这些 assignments，再把 build identity 注入 app runtime 和 hook sidecar build。
 
 `build.rs` 可以为本地开发提供 git fallback，但对外分享包的证明链以脚本注入值为准。Smoke 必须检查 app / hook 的 `git_commit` 都等于当前 `HEAD`，且 app / hook 的 `version`、`git_commit`、`git_commit_short`、`dirty`、`build_time` 一致。
 
@@ -110,15 +110,15 @@ Hook sidecar events 应包含 build identity，尤其是：
 3. 确认 worktree 除了预期 release changes 外是 clean。
 4. 运行 `rtk pnpm release:check-version`。
 5. 运行 `rtk pnpm release:build-identity-env`，确认输出四行 `TOKEN_FIRE_*` assignments。
-6. 运行 `scripts/app-bundle-smoke.sh`。
-7. 如果是完整 release，运行 `scripts/release-smoke.sh`。
+6. 运行 `scripts/release-pipeline.sh --bundle app --allow-dirty` 检查 `.app` bundle。
+7. 如果是完整 release，运行 `scripts/release-pipeline.sh --bundle dmg --clean-required`。
 8. 确认 bundle 包含 `TokenFire.app/Contents/MacOS/token-fire`。
 9. 运行 `rtk pnpm release:check-version`，并确认 logs 或 `--version-json` output 暴露目标 version 和 commit。
 10. 确认 `token-fire --version-json` 和 `token-fire-hook --version-json` 都暴露目标 version、当前 `HEAD` commit、build time 和 dirty flag。
 
 实现时必须让 version consistency 可机器校验。不要只依赖人工检查。
 
-`scripts/app-bundle-smoke.sh` 和 `scripts/release-smoke.sh` 必须检查：
+`scripts/release-pipeline.sh` 必须检查：
 
 - `rtk pnpm release:check-version` 通过；
 - app bundle 包含 `TokenFire.app/Contents/MacOS/token-fire`；
@@ -127,7 +127,7 @@ Hook sidecar events 应包含 build identity，尤其是：
 - `token-fire-hook --version-json` 的 `version` 等于 `package.json`；
 - app / hook 的 `git_commit` 都等于当前 `HEAD`；
 - app / hook 的 `version`、`git_commit`、`git_commit_short`、`dirty`、`build_time` 必须一致；
-- `scripts/release-smoke.sh` 默认拒绝 dirty build，除非 `TOKEN_FIRE_ALLOW_DIRTY_RELEASE=1`。
+- `scripts/release-pipeline.sh --bundle dmg --clean-required` 默认拒绝 dirty build，除非 `TOKEN_FIRE_ALLOW_DIRTY_RELEASE=1`。
 
 诊断包中的 `build_identity` 应使用 nested 结构：
 
