@@ -68,12 +68,20 @@ rtk git commit -m "chore: release 0.1.1"
 rtk git tag -a v0.1.1 -m "v0.1.1"
 rtk git push
 rtk git push origin v0.1.1
-rtk bash scripts/release-pipeline.sh --bundle dmg --clean-required
+rtk bash scripts/local-release.sh
 ```
 
 替换示例里的版本号。只有 baseline release 文案需要同步时，才把 `agent-docs/release-versioning.md` 加入提交。
 
-`scripts/release-pipeline.sh --bundle app --allow-dirty` 只验证 `.app` bundle，不产出 DMG。用户要求“打包的 DMG 文件”或完整发布构建时，必须使用 `scripts/release-pipeline.sh --bundle dmg --clean-required`，并确认 `src-tauri/target/release/bundle/dmg/` 下存在目标 DMG。
+`scripts/release-pipeline.sh --bundle app --allow-dirty` 只验证 `.app` bundle，不产出 DMG。`scripts/release-pipeline.sh --bundle dmg --clean-required` 产出 Tauri 原始 DMG 到 `src-tauri/target/release/bundle/dmg/`，但不会生成发布用的 `dist-app/` 汇总目录。
+
+用户要求“打包的 DMG 文件”或完整发布构建时，必须使用 `scripts/local-release.sh`。它会调用完整 DMG pipeline，并生成：
+
+- `dist-app/TokenFire_X.Y.Z_aarch64.dmg`
+- `dist-app/TokenFire_X.Y.Z_aarch64.dmg.sha256`
+- `dist-app/release-notes-vX.Y.Z.md`
+
+如果只运行了 `scripts/release-pipeline.sh --bundle dmg --clean-required`，还没有完成可上传发布资产整理；需要补齐 `dist-app`，或改跑 `scripts/local-release.sh`。
 
 如果 `git tag -a vX.Y.Z` 失败并提示 tag already exists：
 
