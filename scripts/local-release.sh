@@ -38,8 +38,10 @@ if [[ -n "$(git status --porcelain)" ]]; then
   fail "git worktree 不干净；发布前请先提交或暂存变更"
 fi
 
-echo "==> 检查 dist 忽略规则"
-git check-ignore -q dist || fail "生成发布资产前，dist/ 必须已被 .gitignore 忽略"
+release_dir="dist-app"
+
+echo "==> 检查 dist-app 忽略规则"
+git check-ignore -q "${release_dir}/" || fail "生成发布资产前，${release_dir}/ 必须已被 .gitignore 忽略"
 
 echo "==> 检查版本一致性"
 pnpm release:check-version
@@ -49,9 +51,9 @@ version="$(node -e 'const fs = require("fs"); console.log(JSON.parse(fs.readFile
 eval "$(pnpm --silent release:build-identity-env)"
 export TOKEN_FIRE_GIT_COMMIT TOKEN_FIRE_GIT_COMMIT_SHORT TOKEN_FIRE_GIT_DIRTY TOKEN_FIRE_BUILD_TIME
 
-echo "==> 准备 dist/"
-rm -rf dist
-mkdir -p dist
+echo "==> 准备 dist-app/"
+rm -rf "$release_dir"
+mkdir -p "$release_dir"
 
 echo "==> 构建 token-fire-hook sidecar"
 host_triple="$(rustc -vV | sed -n 's/^host: //p')"
@@ -116,20 +118,20 @@ fi
 
 source_dmg="${dmgs[0]}"
 source_dmg_name="$(basename "$source_dmg")"
-target_dmg="dist/${source_dmg_name}"
+target_dmg="${release_dir}/${source_dmg_name}"
 sha_file="${target_dmg}.sha256"
-notes_file="dist/release-notes-v${version}.md"
+notes_file="${release_dir}/release-notes-v${version}.md"
 
-echo "==> 清理 dist 发布目录"
-rm -rf dist
-mkdir -p dist
+echo "==> 清理 dist-app 发布目录"
+rm -rf "$release_dir"
+mkdir -p "$release_dir"
 
 echo "==> 复制发布资产"
 cp "$source_dmg" "$target_dmg"
 
 echo "==> 写入 SHA-256"
 (
-  cd dist
+  cd "$release_dir"
   shasum -a 256 "$source_dmg_name" > "${source_dmg_name}.sha256"
 )
 sha256_value="$(cut -d ' ' -f 1 "$sha_file")"

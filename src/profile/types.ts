@@ -66,3 +66,21 @@ export interface ProfileCostDrivers {
   cached_input_tokens: number;
   cache_read_ratio: number;
 }
+
+export type ReleaseUpdateStatus =
+  | { state: "unknown"; checked_at: null }
+  | { state: "checking"; checked_at: string | null }
+  | { state: "up_to_date"; checked_at: string; current_version: string; latest_version: string }
+  | {
+      state: "update_available";
+      checked_at: string;
+      current_version: string;
+      current_commit_short: string | null;
+      latest_version: string;
+      latest_tag: string;
+    }
+  | {
+      state: "failed";
+      checked_at: string | null;
+      reason: "network" | "rate_limited" | "http_status" | "invalid_response" | "invalid_version" | "non_stable_release";
+    };

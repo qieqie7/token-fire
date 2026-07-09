@@ -501,12 +501,13 @@ fn local_release_script_prepares_dist_assets_without_remote_release() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = fs::read_to_string(manifest_dir.join("../scripts/local-release.sh")).unwrap();
 
-    assert!(script.contains("rm -rf dist"));
-    assert!(script.contains("mkdir -p dist"));
+    assert!(script.contains("release_dir=\"dist-app\""));
+    assert!(script.contains("rm -rf \"$release_dir\""));
+    assert!(script.contains("mkdir -p \"$release_dir\""));
     assert!(script.contains(".sha256"));
     assert!(script.contains("release-notes-v"));
     assert!(script.contains("shasum -a 256"));
-    assert!(script.contains("git check-ignore -q dist"));
+    assert!(script.contains("git check-ignore -q \"${release_dir}/\""));
     assert!(!script.contains("corepack"));
     assert!(!script.contains("mapfile"));
     assert!(!script.contains("readarray"));
@@ -520,15 +521,15 @@ fn local_release_script_cleans_frontend_dist_before_copying_release_assets() {
     let script = fs::read_to_string(manifest_dir.join("../scripts/local-release.sh")).unwrap();
 
     let tauri_build = script.find("pnpm tauri build").unwrap();
-    let cleanup = script
-        .find("==> 清理 dist 发布目录")
-        .expect("local release script should clean dist after Tauri build rewrites frontend assets");
+    let cleanup = script.find("==> 清理 dist-app 发布目录").expect(
+        "local release script should clean dist-app after Tauri build completes",
+    );
     let copy_assets = script.find("==> 复制发布资产").unwrap();
 
     assert!(tauri_build < cleanup);
     assert!(cleanup < copy_assets);
-    assert!(script[cleanup..copy_assets].contains("rm -rf dist"));
-    assert!(script[cleanup..copy_assets].contains("mkdir -p dist"));
+    assert!(script[cleanup..copy_assets].contains("rm -rf \"$release_dir\""));
+    assert!(script[cleanup..copy_assets].contains("mkdir -p \"$release_dir\""));
 }
 
 #[test]
@@ -568,7 +569,7 @@ fn readme_documents_local_release_and_free_distribution_limits() {
 
     assert!(readme.contains("本地发布"));
     assert!(readme.contains("scripts/local-release.sh"));
-    assert!(readme.contains("dist/"));
+    assert!(readme.contains("dist-app/"));
     assert!(readme.contains("TokenFire Profile 截图"));
     assert!(readme.contains("Developer ID"));
     assert!(readme.contains("Apple notarization"));
@@ -673,4 +674,16 @@ fn retention_policy_is_not_exposed_to_user_surfaces() {
     assert!(!tray_rs.contains("retention"));
     assert!(!hook_rs.contains("RETENTION"));
     assert!(!hook_rs.contains("retention"));
+}
+
+#[test]
+fn main_runtime_registers_release_update_commands_and_startup_check() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main_rs = std::fs::read_to_string(manifest_dir.join("src/main.rs")).unwrap();
+
+    assert!(main_rs.contains("release_update_status"));
+    assert!(main_rs.contains("open_latest_release"));
+    assert!(main_rs.contains("ReleaseUpdateStateStore::default()"));
+    assert!(main_rs.contains("start_release_check_on_startup"));
+    assert!(!main_rs.contains("tauri_plugin_updater"));
 }

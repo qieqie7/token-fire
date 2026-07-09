@@ -59,4 +59,15 @@ describe("profile css", () => {
     expect(version).toContain("white-space: nowrap;");
     expect(version).toContain("font-family: var(--font-family-mono);");
   });
+
+  it("keeps the release update badge compact in the Profile header", () => {
+    const css = readFileSync(profileCssPath, "utf8");
+    const base = cssBlock(css, ".profile-version");
+    const badge = cssBlock(css, ".profile-version--update");
+
+    expect(base).toContain("text-overflow: ellipsis;");
+    expect(base).toContain("white-space: nowrap;");
+    expect(badge).toContain("border-radius: 999px;");
+    expect(badge).toContain("max-width: 190px;");
+  });
 });

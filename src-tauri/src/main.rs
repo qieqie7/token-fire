@@ -12,8 +12,12 @@ use token_fire::app::build_identity::{
     current_build_identity, has_version_json_arg, log_app_started, print_version_json,
     BuildIdentity,
 };
-use token_fire::app::logging::DebugLogGate;
+use token_fire::app::logging::{DebugLogGate, RuntimeLogSinks};
 use token_fire::app::paths::runtime_paths;
+use token_fire::app::release_check::{
+    open_release_url, start_release_check_on_startup, trusted_release_url_for_status,
+    GithubReleaseHttpClient, ReleaseCheckStore, ReleaseUpdateStateStore, ReleaseUpdateStatus,
+};
 use token_fire::app::runtime::start_app_runtime_for_state_with_widget_events;
 use token_fire::app::state::AppState;
 use token_fire::app::tracking::TrackingGate;
@@ -37,6 +41,17 @@ fn profile_summary(
 #[tauri::command]
 fn build_identity() -> BuildIdentity {
     current_build_identity()
+}
+
+#[tauri::command]
+fn release_update_status(state: State<'_, ReleaseUpdateStateStore>) -> ReleaseUpdateStatus {
+    state.get()
+}
+
+#[tauri::command]
+fn open_latest_release(state: State<'_, ReleaseUpdateStateStore>) -> Result<(), String> {
+    let url = trusted_release_url_for_status(&state.get());
+    open_release_url(&url).map_err(|error| error.to_string())
 }
 
 fn main() {
@@ -85,12 +100,32 @@ fn main() {
     let runtime_traex_paths = traex_paths.clone();
     let runtime_tracking_gate = tracking_gate.clone();
     let runtime_debug_gate = debug_gate.clone();
+    let release_update_state = ReleaseUpdateStateStore::default();
+    let release_check_store = ReleaseCheckStore::new(paths.home.join("release-check.json"));
+    let release_checker = token_fire::app::release_check::ReleaseChecker::new(
+        release_check_store,
+        GithubReleaseHttpClient::default(),
+        RuntimeLogSinks::new(paths.clone(), debug_gate.clone()),
+    );
+    let release_build_identity = build_identity_value.clone();
 
     tauri::Builder::default()
         .manage(app_state)
-        .invoke_handler(tauri::generate_handler![profile_summary, build_identity])
+        .manage(release_update_state.clone())
+        .invoke_handler(tauri::generate_handler![
+            profile_summary,
+            build_identity,
+            release_update_status,
+            open_latest_release
+        ])
         .setup(move |app| {
             install_tray(app.handle())?;
+            start_release_check_on_startup(
+                app.handle().clone(),
+                release_update_state.clone(),
+                release_checker.clone(),
+                release_build_identity.clone(),
+            );
             let refresh_handle = start_tray_refresh_loop(app.handle().clone());
             app.manage(Mutex::new(refresh_handle));
             let state = app.state::<AppState>();

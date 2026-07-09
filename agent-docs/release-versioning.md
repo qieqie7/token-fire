@@ -81,6 +81,14 @@ v0.1.1 · 7e17eb0
 
 Profile 保持紧凑，不变成 release dashboard。完整 build details 放在日志和诊断包里。
 
+## GitHub 更新提示
+
+TokenFire 的更新提示以 `qieqie7/token-fire` 的 GitHub latest stable Release 为数据源。
+
+应用启动后会静默检查一次，并在成功检查后的 24 小时内复用 `~/.token-fire/release-check.json` 缓存。发现远端版本高于当前 `build_identity.version` 时，Profile header 显示 `当前版本 · commitid 可更新`，点击后打开 GitHub Release 页面。
+
+这不是自动更新器：不会自动下载 DMG，不会替换 `/Applications/TokenFire.app`，也不接入 `tauri-plugin-updater`。
+
 ## 日志规则
 
 Runtime startup 应写入带 build identity 的 `app_started` 事件。

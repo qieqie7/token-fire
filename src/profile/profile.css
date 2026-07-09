@@ -47,6 +47,17 @@
   white-space: nowrap;
 }
 
+.profile-version--update {
+  appearance: none;
+  max-width: 190px;
+  border: 1px solid rgba(255, 138, 52, 0.46);
+  border-radius: 999px;
+  padding: 4px 7px;
+  background: rgba(255, 138, 52, 0.11);
+  color: #fed7aa;
+  cursor: pointer;
+}
+
 .profile-brand__flame {
   width: 18px;
   height: 18px;

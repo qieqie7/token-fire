@@ -3,6 +3,7 @@
 node_modules/
 .pnpm-store/
 dist/
+dist-app/
 src-tauri/bin/
 src-tauri/gen/
 src-tauri/target/

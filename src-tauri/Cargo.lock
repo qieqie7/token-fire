@@ -3648,6 +3648,7 @@ dependencies = [
  "notify",
  "predicates",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

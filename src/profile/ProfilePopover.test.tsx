@@ -178,4 +178,53 @@ describe("ProfilePopover", () => {
     expect(html).toContain("v0.1.1 · 7e17eb0 · dirty");
     expect(html).not.toContain("unix:123");
   });
+
+  it("shows current build identity with update marker when a newer release is available", () => {
+    const html = renderToStaticMarkup(
+      <ProfilePopover
+        period="this_month"
+        summary={summary}
+        loading={false}
+        error={false}
+        buildIdentity={{ ...buildIdentity, version: "0.1.0", git_commit_short: "2b67267" }}
+        releaseUpdate={{
+          state: "update_available",
+          checked_at: "2026-07-09T10:00:00Z",
+          current_version: "0.1.0",
+          current_commit_short: "2b67267",
+          latest_version: "0.1.1",
+          latest_tag: "v0.1.1",
+        }}
+        onOpenRelease={() => {}}
+        onPeriodChange={() => {}}
+      />,
+    );
+
+    expect(html).toContain("v0.1.0 · 2b67267 可更新");
+    expect(html).toContain("TokenFire v0.1.1 可用，当前 v0.1.0 · 2b67267，点击打开 GitHub Release");
+    expect(html).not.toContain(">v0.1.1 可用<");
+  });
+
+  it("keeps the normal build identity label when release status is not update_available", () => {
+    const html = renderToStaticMarkup(
+      <ProfilePopover
+        period="this_month"
+        summary={summary}
+        loading={false}
+        error={false}
+        buildIdentity={buildIdentity}
+        releaseUpdate={{
+          state: "up_to_date",
+          checked_at: "2026-07-09T10:00:00Z",
+          current_version: "0.1.1",
+          latest_version: "0.1.1",
+        }}
+        onOpenRelease={() => {}}
+        onPeriodChange={() => {}}
+      />,
+    );
+
+    expect(html).toContain("v0.1.1 · 7e17eb0");
+    expect(html).not.toContain("可更新");
+  });
 });

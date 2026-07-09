@@ -1,4 +1,4 @@
-import type { BuildIdentity, ProfilePeriod, ProfileSummary } from "./types";
+import type { BuildIdentity, ProfilePeriod, ProfileSummary, ReleaseUpdateStatus } from "./types";
 import { AppSources } from "./AppSources";
 import { MetricPair } from "./MetricPair";
 import { PeriodFilter } from "./PeriodFilter";
@@ -12,6 +12,8 @@ export interface ProfilePopoverProps {
   loading: boolean;
   error: boolean;
   buildIdentity: BuildIdentity | null;
+  releaseUpdate?: ReleaseUpdateStatus | null;
+  onOpenRelease?: () => void;
   onPeriodChange: (period: ProfilePeriod) => void;
 }
 
@@ -22,17 +24,37 @@ export function formatBuildIdentityLabel(identity: BuildIdentity): string {
   return parts.join(" · ");
 }
 
+export function formatUpdateBadgeLabel(
+  identity: BuildIdentity,
+  releaseUpdate: ReleaseUpdateStatus | null | undefined,
+): string | null {
+  if (releaseUpdate?.state !== "update_available") return null;
+  return `${formatBuildIdentityLabel(identity)} 可更新`;
+}
+
+export function formatUpdateBadgeTitle(
+  identity: BuildIdentity,
+  releaseUpdate: ReleaseUpdateStatus | null | undefined,
+): string | null {
+  if (releaseUpdate?.state !== "update_available") return null;
+  return `TokenFire v${releaseUpdate.latest_version} 可用，当前 ${formatBuildIdentityLabel(identity)}，点击打开 GitHub Release`;
+}
+
 export function ProfilePopover({
   period,
   summary,
   loading,
   error,
   buildIdentity,
+  releaseUpdate = null,
+  onOpenRelease,
   onPeriodChange,
 }: ProfilePopoverProps) {
   const year = summary?.year_profile ?? null;
   const selectedPeriod = summary?.selected_period ?? null;
   const buildIdentityLabel = buildIdentity ? formatBuildIdentityLabel(buildIdentity) : null;
+  const updateBadgeLabel = buildIdentity ? formatUpdateBadgeLabel(buildIdentity, releaseUpdate) : null;
+  const updateBadgeTitle = buildIdentity ? formatUpdateBadgeTitle(buildIdentity, releaseUpdate) : null;
 
   return (
     <main className="profile-popover">
@@ -41,7 +63,16 @@ export function ProfilePopover({
           <span className="profile-brand__flame" />
           <span>TokenFire</span>
         </div>
-        {buildIdentityLabel ? (
+        {updateBadgeLabel ? (
+          <button
+            className="profile-version profile-version--update"
+            title={updateBadgeTitle ?? updateBadgeLabel}
+            type="button"
+            onClick={onOpenRelease}
+          >
+            {updateBadgeLabel}
+          </button>
+        ) : buildIdentityLabel ? (
           <span className="profile-version" title={`TokenFire ${buildIdentityLabel}`}>
             {buildIdentityLabel}
           </span>

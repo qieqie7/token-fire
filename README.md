@@ -89,16 +89,16 @@ scripts/release-smoke.sh
 scripts/local-release.sh
 ```
 
-脚本会运行测试和完整 Tauri build，并把需要手动上传到 GitHub Release 的关键产物统一放到仓库根目录 `dist/`：
+脚本会运行测试和完整 Tauri build，并把需要手动上传到 GitHub Release 的关键产物统一放到仓库根目录 `dist-app/`：
 
 ```text
-dist/
+dist-app/
   <Tauri 生成的 DMG 文件名>.dmg
   <Tauri 生成的 DMG 文件名>.dmg.sha256
   release-notes-v<version>.md
 ```
 
-上传 GitHub Release 时，使用 `dist/` 里的 DMG 和 `.sha256` 文件，并复制 `release-notes-v<version>.md` 的内容作为发布说明草稿。
+上传 GitHub Release 时，使用 `dist-app/` 里的 DMG 和 `.sha256` 文件，并复制 `release-notes-v<version>.md` 的内容作为发布说明草稿。
 
 ## 免费分发限制
 
@@ -136,4 +136,4 @@ agent-docs/         长期设计说明
 
 - 前端使用 React、TypeScript 和普通 CSS variables。
 - 后端使用 Rust 2021、Tauri v2 和 `rusqlite`。
-- `dist/`、`src-tauri/target/`、`src-tauri/bin/`、`.worktrees/`、`node_modules/` 等生成产物不要加入 git。
+- `dist/`、`dist-app/`、`src-tauri/target/`、`src-tauri/bin/`、`.worktrees/`、`node_modules/` 等生成产物不要加入 git。
