@@ -1,0 +1,4 @@
+{"role":"user","message":{"content":[{"type":"text","text":"SENTINEL_CURSOR_USER_ROUND_ONE"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"SENTINEL_CURSOR_ASSISTANT_ROUND_ONE"}]}}
+{"role":"user","message":{"content":[{"type":"text","text":"SENTINEL_CURSOR_USER_ROUND_TWO"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"SENTINEL_CURSOR_ASSISTANT_ROUND_TWO"}]}}

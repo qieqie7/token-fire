@@ -1,0 +1,12 @@
+[[Stop.hooks]]
+command = "'/Applications/Flux.app/Contents/MacOS/flux-hook' --owner flux"
+type = "command"
+timeout = 5
+
+[[Notification.hooks]]
+command = "notify-hook"
+type = "command"
+timeout = 1
+
+[unknown]
+keep = true
