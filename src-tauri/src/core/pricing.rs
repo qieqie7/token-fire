@@ -80,6 +80,19 @@ pub enum Currency {
 pub enum ModelMatch {
     Exact(&'static str),
     Prefix(&'static str),
+    Keywords {
+        required: &'static [&'static str],
+        forbidden: &'static [&'static str],
+        forbidden_prefixes: &'static [&'static str],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct MatchScore {
+    kind: u8,
+    required_count: u8,
+    version_specificity: u8,
+    priority: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,154 +108,330 @@ pub struct PricingRule {
     pub reasoning_output_per_1m: Option<f64>,
 }
 
+const fn usd_rule(
+    id: &'static str,
+    priority: u32,
+    model_match: ModelMatch,
+    input_per_1m: f64,
+    cached_input_per_1m: Option<f64>,
+    cache_creation_input_per_1m: Option<f64>,
+    output_per_1m: f64,
+) -> PricingRule {
+    PricingRule {
+        id,
+        priority,
+        model_match,
+        currency: Currency::Usd,
+        input_per_1m,
+        output_per_1m,
+        cached_input_per_1m,
+        cache_creation_input_per_1m,
+        reasoning_output_per_1m: Some(output_per_1m),
+    }
+}
+
+const fn cny_rule(
+    id: &'static str,
+    priority: u32,
+    model_match: ModelMatch,
+    input_per_1m: f64,
+    cached_input_per_1m: Option<f64>,
+    cache_creation_input_per_1m: Option<f64>,
+    output_per_1m: f64,
+) -> PricingRule {
+    PricingRule {
+        id,
+        priority,
+        model_match,
+        currency: Currency::Cny,
+        input_per_1m,
+        output_per_1m,
+        cached_input_per_1m,
+        cache_creation_input_per_1m,
+        reasoning_output_per_1m: Some(output_per_1m),
+    }
+}
+
 const PRICING_RULES: &[PricingRule] = &[
-    PricingRule {
-        id: "gpt-5.5",
-        priority: 100,
-        model_match: ModelMatch::Prefix("gpt-5.5"),
-        currency: Currency::Usd,
-        input_per_1m: 5.00,
-        output_per_1m: 30.00,
-        cached_input_per_1m: Some(0.50),
-        cache_creation_input_per_1m: Some(5.00),
-        reasoning_output_per_1m: Some(30.00),
-    },
-    PricingRule {
-        id: "gpt-5.4",
-        priority: 95,
-        model_match: ModelMatch::Prefix("gpt-5.4"),
-        currency: Currency::Usd,
-        input_per_1m: 2.50,
-        output_per_1m: 15.00,
-        cached_input_per_1m: Some(0.25),
-        cache_creation_input_per_1m: Some(2.50),
-        reasoning_output_per_1m: Some(15.00),
-    },
-    PricingRule {
-        id: "gpt-5",
-        priority: 90,
-        model_match: ModelMatch::Prefix("gpt-5"),
-        currency: Currency::Usd,
-        input_per_1m: 1.25,
-        output_per_1m: 10.00,
-        cached_input_per_1m: Some(0.125),
-        cache_creation_input_per_1m: Some(1.25),
-        reasoning_output_per_1m: Some(10.00),
-    },
-    PricingRule {
-        id: "claude-sonnet",
-        priority: 80,
-        model_match: ModelMatch::Prefix("claude-sonnet"),
-        currency: Currency::Usd,
-        input_per_1m: 3.00,
-        output_per_1m: 15.00,
-        cached_input_per_1m: Some(0.30),
-        cache_creation_input_per_1m: Some(3.75),
-        reasoning_output_per_1m: Some(15.00),
-    },
-    PricingRule {
-        id: "kimi-k2.6",
-        priority: 70,
-        model_match: ModelMatch::Prefix("kimi-k2.6"),
-        currency: Currency::Usd,
-        input_per_1m: 0.95,
-        output_per_1m: 4.00,
-        cached_input_per_1m: Some(0.16),
-        cache_creation_input_per_1m: Some(0.95),
-        reasoning_output_per_1m: Some(4.00),
-    },
-    PricingRule {
-        id: "kimi-k2.5",
-        priority: 69,
-        model_match: ModelMatch::Prefix("kimi-k2.5"),
-        currency: Currency::Usd,
-        input_per_1m: 0.60,
-        output_per_1m: 3.00,
-        cached_input_per_1m: Some(0.10),
-        cache_creation_input_per_1m: Some(0.60),
-        reasoning_output_per_1m: Some(3.00),
-    },
-    PricingRule {
-        id: "gemini-2.5-flash",
-        priority: 68,
-        model_match: ModelMatch::Prefix("gemini-2.5-flash"),
-        currency: Currency::Usd,
-        input_per_1m: 0.30,
-        output_per_1m: 2.50,
-        cached_input_per_1m: Some(0.075),
-        cache_creation_input_per_1m: Some(0.30),
-        reasoning_output_per_1m: Some(2.50),
-    },
-    PricingRule {
-        id: "gemini-2.5-pro",
-        priority: 67,
-        model_match: ModelMatch::Prefix("gemini-2.5-pro"),
-        currency: Currency::Usd,
-        input_per_1m: 1.25,
-        output_per_1m: 10.00,
-        cached_input_per_1m: Some(0.3125),
-        cache_creation_input_per_1m: Some(1.25),
-        reasoning_output_per_1m: Some(10.00),
-    },
-    PricingRule {
-        id: "deepseek-v4-flash",
-        priority: 66,
-        model_match: ModelMatch::Prefix("deepseek-v4-flash"),
-        currency: Currency::Usd,
-        input_per_1m: 0.14,
-        output_per_1m: 0.28,
-        cached_input_per_1m: Some(0.0028),
-        cache_creation_input_per_1m: Some(0.14),
-        reasoning_output_per_1m: Some(0.28),
-    },
-    PricingRule {
-        id: "deepseek-v4-pro",
-        priority: 65,
-        model_match: ModelMatch::Prefix("deepseek-v4-pro"),
-        currency: Currency::Usd,
-        input_per_1m: 0.435,
-        output_per_1m: 0.87,
-        cached_input_per_1m: Some(0.0036),
-        cache_creation_input_per_1m: Some(0.435),
-        reasoning_output_per_1m: Some(0.87),
-    },
-    PricingRule {
-        id: "qwen3-max",
-        priority: 64,
-        model_match: ModelMatch::Prefix("qwen3-max"),
-        currency: Currency::Cny,
-        input_per_1m: 3.00,
-        output_per_1m: 12.00,
-        cached_input_per_1m: Some(3.00),
-        cache_creation_input_per_1m: Some(3.00),
-        reasoning_output_per_1m: Some(12.00),
-    },
-    PricingRule {
-        id: "qwen-max",
-        priority: 63,
-        model_match: ModelMatch::Prefix("qwen-max"),
-        currency: Currency::Cny,
-        input_per_1m: 2.40,
-        output_per_1m: 9.60,
-        cached_input_per_1m: Some(2.40),
-        cache_creation_input_per_1m: Some(2.40),
-        reasoning_output_per_1m: Some(9.60),
-    },
-    PricingRule {
-        id: "doubao-seed-1.6",
-        priority: 62,
-        model_match: ModelMatch::Prefix("doubao-seed-1.6"),
-        currency: Currency::Cny,
-        input_per_1m: 0.40,
-        output_per_1m: 4.00,
-        cached_input_per_1m: Some(0.16),
-        cache_creation_input_per_1m: Some(0.40),
-        reasoning_output_per_1m: Some(4.00),
-    },
+    usd_rule(
+        "gpt-5.6-sol",
+        160,
+        ModelMatch::Keywords {
+            required: &["gpt", "5.6", "sol"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        5.00,
+        Some(0.50),
+        Some(6.25),
+        30.00,
+    ),
+    usd_rule(
+        "gpt-5.6-terra",
+        159,
+        ModelMatch::Keywords {
+            required: &["gpt", "5.6", "terra"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        2.50,
+        Some(0.25),
+        Some(3.125),
+        15.00,
+    ),
+    usd_rule(
+        "gpt-5.6-luna",
+        158,
+        ModelMatch::Keywords {
+            required: &["gpt", "5.6", "luna"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        1.00,
+        Some(0.10),
+        Some(1.25),
+        6.00,
+    ),
+    usd_rule("gpt-5.5-pro", 157, ModelMatch::Keywords {
+        required: &["gpt", "5.5", "pro"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 30.00, None, None, 180.00),
+    usd_rule("gpt-5.5", 156, ModelMatch::Keywords {
+        required: &["gpt", "5.5"],
+        forbidden: &["pro"],
+        forbidden_prefixes: &[],
+    }, 5.00, Some(0.50), None, 30.00),
+    usd_rule("gpt-5.4-pro", 155, ModelMatch::Keywords {
+        required: &["gpt", "5.4", "pro"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 30.00, None, None, 180.00),
+    usd_rule("gpt-5.4-mini", 154, ModelMatch::Keywords {
+        required: &["gpt", "5.4", "mini"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 0.75, Some(0.075), None, 4.50),
+    usd_rule("gpt-5.4-nano", 153, ModelMatch::Keywords {
+        required: &["gpt", "5.4", "nano"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 0.20, Some(0.02), None, 1.25),
+    usd_rule("gpt-5.4", 152, ModelMatch::Keywords {
+        required: &["gpt", "5.4"],
+        forbidden: &["mini", "nano", "pro"],
+        forbidden_prefixes: &[],
+    }, 2.50, Some(0.25), None, 15.00),
+    usd_rule("gpt-5.2-pro", 151, ModelMatch::Keywords {
+        required: &["gpt", "5.2", "pro"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 21.00, None, None, 168.00),
+    usd_rule("gpt-5.2", 150, ModelMatch::Keywords {
+        required: &["gpt", "5.2"],
+        forbidden: &["pro"],
+        forbidden_prefixes: &[],
+    }, 1.75, Some(0.175), None, 14.00),
+    usd_rule("gpt-5.1", 149, ModelMatch::Keywords {
+        required: &["gpt", "5.1"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 1.25, Some(0.125), None, 10.00),
+    usd_rule("gpt-5-pro", 148, ModelMatch::Keywords {
+        required: &["gpt", "5", "pro"],
+        forbidden: &[],
+        forbidden_prefixes: &["5."],
+    }, 15.00, None, None, 120.00),
+    usd_rule("gpt-5-mini", 147, ModelMatch::Keywords {
+        required: &["gpt", "5", "mini"],
+        forbidden: &[],
+        forbidden_prefixes: &["5."],
+    }, 0.25, Some(0.025), None, 2.00),
+    usd_rule("gpt-5-nano", 146, ModelMatch::Keywords {
+        required: &["gpt", "5", "nano"],
+        forbidden: &[],
+        forbidden_prefixes: &["5."],
+    }, 0.05, Some(0.005), None, 0.40),
+    usd_rule("gpt-5", 145, ModelMatch::Keywords {
+        required: &["gpt", "5"],
+        forbidden: &["mini", "nano", "pro"],
+        forbidden_prefixes: &["5."],
+    }, 1.25, Some(0.125), None, 10.00),
+    usd_rule("gpt-4.1-mini", 144, ModelMatch::Keywords {
+        required: &["gpt", "4.1", "mini"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 0.40, Some(0.10), None, 1.60),
+    usd_rule("gpt-4.1-nano", 143, ModelMatch::Keywords {
+        required: &["gpt", "4.1", "nano"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 0.10, Some(0.025), None, 0.40),
+    usd_rule("gpt-4.1", 142, ModelMatch::Keywords {
+        required: &["gpt", "4.1"],
+        forbidden: &["mini", "nano"],
+        forbidden_prefixes: &[],
+    }, 2.00, Some(0.50), None, 8.00),
+    usd_rule("gpt-4o-2024-05-13", 141, ModelMatch::Keywords {
+        required: &["gpt", "4o", "2024", "05", "13"],
+        forbidden: &["mini"],
+        forbidden_prefixes: &[],
+    }, 5.00, None, None, 15.00),
+    usd_rule("gpt-4o-mini", 140, ModelMatch::Keywords {
+        required: &["gpt", "4o", "mini"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 0.15, Some(0.075), None, 0.60),
+    usd_rule("gpt-4o", 139, ModelMatch::Keywords {
+        required: &["gpt", "4o"],
+        forbidden: &["mini"],
+        forbidden_prefixes: &[],
+    }, 2.50, Some(1.25), None, 10.00),
+    usd_rule("o1-pro", 138, ModelMatch::Keywords {
+        required: &["o1", "pro"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 150.00, None, None, 600.00),
+    usd_rule("o1-mini", 137, ModelMatch::Keywords {
+        required: &["o1", "mini"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 1.10, Some(0.55), None, 4.40),
+    usd_rule("o1", 136, ModelMatch::Keywords {
+        required: &["o1"],
+        forbidden: &["mini", "pro"],
+        forbidden_prefixes: &[],
+    }, 15.00, Some(7.50), None, 60.00),
+    usd_rule("o3-pro", 135, ModelMatch::Keywords {
+        required: &["o3", "pro"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 20.00, None, None, 80.00),
+    usd_rule("o3-mini", 134, ModelMatch::Keywords {
+        required: &["o3", "mini"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 1.10, Some(0.55), None, 4.40),
+    usd_rule("o3", 133, ModelMatch::Keywords {
+        required: &["o3"],
+        forbidden: &["mini", "pro", "deep", "research"],
+        forbidden_prefixes: &[],
+    }, 2.00, Some(0.50), None, 8.00),
+    usd_rule("o4-mini", 132, ModelMatch::Keywords {
+        required: &["o4", "mini"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 1.10, Some(0.275), None, 4.40),
+    usd_rule("claude-fable-5", 120, ModelMatch::Keywords {
+        required: &["claude", "fable", "5"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 10.00, Some(1.00), Some(12.50), 50.00),
+    usd_rule("claude-mythos-5", 119, ModelMatch::Keywords {
+        required: &["claude", "mythos", "5"],
+        forbidden: &["preview"],
+        forbidden_prefixes: &[],
+    }, 10.00, Some(1.00), Some(12.50), 50.00),
+    usd_rule("claude-opus-4-8", 118, ModelMatch::Keywords {
+        required: &["claude", "opus", "4.8"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 5.00, Some(0.50), Some(6.25), 25.00),
+    usd_rule("claude-opus-4-7", 117, ModelMatch::Keywords {
+        required: &["claude", "opus", "4.7"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 5.00, Some(0.50), Some(6.25), 25.00),
+    usd_rule("claude-opus-4-6", 116, ModelMatch::Keywords {
+        required: &["claude", "opus", "4.6"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 5.00, Some(0.50), Some(6.25), 25.00),
+    usd_rule("claude-opus-4-5", 115, ModelMatch::Keywords {
+        required: &["claude", "opus", "4.5"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 5.00, Some(0.50), Some(6.25), 25.00),
+    // Introductory pricing is valid through 2026-08-31; revisit before 2026-09-01.
+    usd_rule("claude-sonnet-5", 114, ModelMatch::Keywords {
+        required: &["claude", "sonnet", "5"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 2.00, Some(0.20), Some(2.50), 10.00),
+    usd_rule("claude-sonnet-4-6", 113, ModelMatch::Keywords {
+        required: &["claude", "sonnet", "4.6"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 3.00, Some(0.30), Some(3.75), 15.00),
+    usd_rule("claude-sonnet-4-5", 112, ModelMatch::Keywords {
+        required: &["claude", "sonnet", "4.5"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 3.00, Some(0.30), Some(3.75), 15.00),
+    usd_rule("claude-sonnet", 111, ModelMatch::Keywords {
+        required: &["claude", "sonnet"],
+        forbidden: &["5", "4.6", "4.5"],
+        forbidden_prefixes: &[],
+    }, 3.00, Some(0.30), Some(3.75), 15.00),
+    usd_rule("claude-haiku-4-5", 110, ModelMatch::Keywords {
+        required: &["claude", "haiku", "4.5"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 1.00, Some(0.10), Some(1.25), 5.00),
+    usd_rule("claude-haiku-3-5", 109, ModelMatch::Keywords {
+        required: &["claude", "haiku", "3.5"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 0.80, Some(0.08), Some(1.00), 4.00),
+    usd_rule("kimi-k2.6", 90, ModelMatch::Keywords {
+        required: &["kimi", "2.6"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 0.95, Some(0.16), Some(0.95), 4.00),
+    usd_rule("kimi-k2.5", 89, ModelMatch::Keywords {
+        required: &["kimi", "2.5"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 0.60, Some(0.10), Some(0.60), 3.00),
+    usd_rule("gemini-2.5-flash", 88, ModelMatch::Keywords {
+        required: &["gemini", "2.5", "flash"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 0.30, Some(0.075), Some(0.30), 2.50),
+    usd_rule("gemini-2.5-pro", 87, ModelMatch::Keywords {
+        required: &["gemini", "2.5", "pro"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 1.25, Some(0.3125), Some(1.25), 10.00),
+    usd_rule("deepseek-v4-flash", 86, ModelMatch::Keywords {
+        required: &["deepseek", "v4", "flash"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 0.14, Some(0.0028), Some(0.14), 0.28),
+    usd_rule("deepseek-v4-pro", 85, ModelMatch::Keywords {
+        required: &["deepseek", "v4", "pro"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 0.435, Some(0.0036), Some(0.435), 0.87),
+    cny_rule("qwen3-max", 84, ModelMatch::Keywords {
+        required: &["qwen3", "max"],
+        forbidden: &[],
+        forbidden_prefixes: &["qwen3.", "3."],
+    }, 3.00, Some(3.00), Some(3.00), 12.00),
+    cny_rule("qwen-max", 83, ModelMatch::Keywords {
+        required: &["qwen", "max"],
+        forbidden: &["qwen3"],
+        forbidden_prefixes: &[],
+    }, 2.40, Some(2.40), Some(2.40), 9.60),
+    cny_rule("doubao-seed-1.6", 82, ModelMatch::Keywords {
+        required: &["doubao", "seed", "1.6"],
+        forbidden: &[],
+        forbidden_prefixes: &[],
+    }, 0.40, Some(0.16), Some(0.40), 4.00),
 ];
 
 const FALLBACK_PRICING_RULE: PricingRule = PricingRule {
-    id: "fallback-average",
+    id: "fallback-component-rates",
     priority: 0,
     model_match: ModelMatch::Prefix(""),
     currency: Currency::Cny,
@@ -253,29 +442,180 @@ const FALLBACK_PRICING_RULE: PricingRule = PricingRule {
     reasoning_output_per_1m: Some(DEFAULT_REASONING_OUTPUT_CNY_PER_1M_TOKENS),
 };
 
-fn model_matches(rule: PricingRule, model: &str) -> bool {
-    match rule.model_match {
-        ModelMatch::Exact(expected) => model.eq_ignore_ascii_case(expected),
-        ModelMatch::Prefix(prefix) => model
-            .get(..prefix.len())
-            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix)),
+fn tokenize_model(model: &str) -> Vec<String> {
+    let lower = model.to_ascii_lowercase();
+    let segments: Vec<&str> = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    let mut tokens = Vec::new();
+    for segment in &segments {
+        push_unique_token(&mut tokens, segment);
+        if let Some((alpha, numeric)) = split_alpha_numeric(segment) {
+            push_unique_token(&mut tokens, alpha);
+            push_unique_token(&mut tokens, numeric);
+        }
+    }
+
+    for pair in segments.windows(2) {
+        let left = pair[0];
+        let right = pair[1];
+        if is_short_numeric(left) && is_short_numeric(right) {
+            push_unique_token(&mut tokens, &format!("{left}.{right}"));
+        }
+        if is_alpha_token(left) && is_short_numeric(right) {
+            push_unique_token(&mut tokens, &format!("{left}{right}"));
+        }
+        if let Some((_alpha, numeric)) = split_alpha_numeric(left) {
+            if is_short_numeric(numeric) && is_short_numeric(right) {
+                push_unique_token(&mut tokens, &format!("{left}.{right}"));
+                push_unique_token(&mut tokens, &format!("{numeric}.{right}"));
+            }
+        }
+    }
+
+    tokens
+}
+
+fn push_unique_token(tokens: &mut Vec<String>, token: &str) {
+    if !tokens.iter().any(|existing| existing == token) {
+        tokens.push(token.to_string());
     }
 }
 
-fn match_rank(rule: PricingRule) -> u32 {
+fn split_alpha_numeric(segment: &str) -> Option<(&str, &str)> {
+    let split_at = segment
+        .char_indices()
+        .find_map(|(index, ch)| ch.is_ascii_digit().then_some(index))?;
+    if split_at == 0 {
+        return None;
+    }
+    let (alpha, numeric) = segment.split_at(split_at);
+    if alpha.chars().all(|ch| ch.is_ascii_alphabetic())
+        && numeric.chars().all(|ch| ch.is_ascii_digit())
+    {
+        Some((alpha, numeric))
+    } else {
+        None
+    }
+}
+
+fn is_short_numeric(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 4 && value.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_alpha_token(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_alphabetic())
+}
+
+fn has_token(tokens: &[String], expected: &str) -> bool {
+    tokens.iter().any(|token| token == expected)
+}
+
+fn has_token_with_prefix(tokens: &[String], prefix: &str) -> bool {
+    tokens.iter().any(|token| token.starts_with(prefix))
+}
+
+fn has_prefixed_major_version_at_least(
+    tokens: &[String],
+    prefix: &str,
+    minimum: u16,
+) -> bool {
+    tokens
+        .iter()
+        .filter_map(|token| token.strip_prefix(prefix))
+        .filter_map(parse_major_version_token)
+        .any(|version| version >= minimum)
+}
+
+fn parse_major_version_token(token: &str) -> Option<u16> {
+    if token.is_empty()
+        || token.len() > 3
+        || !token.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
+    token.parse().ok()
+}
+
+fn hits_future_version_guard(rule_id: &str, tokens: &[String]) -> bool {
+    // Guard broad legacy rules from inheriting prices for unreviewed future majors.
+    match rule_id {
+        "claude-sonnet" => has_prefixed_major_version_at_least(tokens, "sonnet", 6),
+        "qwen-max" => has_prefixed_major_version_at_least(tokens, "qwen", 4),
+        _ => false,
+    }
+}
+
+fn version_specificity(required: &[&str]) -> u8 {
+    required
+        .iter()
+        .filter(|token| token.chars().any(|ch| ch == '.'))
+        .count() as u8
+}
+
+fn prefix_matches(model: &str, prefix: &str) -> bool {
+    model
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+}
+
+fn match_score(rule: PricingRule, model: &str, tokens: &[String]) -> Option<MatchScore> {
     match rule.model_match {
-        ModelMatch::Exact(_) => rule.priority * 2 + 1,
-        ModelMatch::Prefix(_) => rule.priority * 2,
+        ModelMatch::Exact(expected) if model.eq_ignore_ascii_case(expected) => Some(MatchScore {
+            kind: 3,
+            required_count: u8::MAX,
+            version_specificity: u8::MAX,
+            priority: rule.priority,
+        }),
+        ModelMatch::Exact(_) => None,
+        ModelMatch::Keywords {
+            required,
+            forbidden,
+            forbidden_prefixes,
+        } => {
+            let required_matches = required.iter().all(|expected| has_token(tokens, expected));
+            let forbidden_matches = forbidden.iter().any(|blocked| has_token(tokens, blocked));
+            let prefix_matches = forbidden_prefixes
+                .iter()
+                .any(|prefix| has_token_with_prefix(tokens, prefix));
+            let future_version_matches = hits_future_version_guard(rule.id, tokens);
+
+            if required_matches
+                && !forbidden_matches
+                && !prefix_matches
+                && !future_version_matches
+            {
+                Some(MatchScore {
+                    kind: 2,
+                    required_count: required.len() as u8,
+                    version_specificity: version_specificity(required),
+                    priority: rule.priority,
+                })
+            } else {
+                None
+            }
+        }
+        ModelMatch::Prefix(prefix) if prefix_matches(model, prefix) => Some(MatchScore {
+            kind: 1,
+            required_count: 0,
+            version_specificity: 0,
+            priority: rule.priority,
+        }),
+        ModelMatch::Prefix(_) => None,
     }
 }
 
 fn find_rule(model: Option<&str>) -> Option<PricingRule> {
     let model = model?;
+    let tokens = tokenize_model(model);
     PRICING_RULES
         .iter()
         .copied()
-        .filter(|rule| model_matches(*rule, model))
-        .max_by_key(|rule| match_rank(*rule))
+        .filter_map(|rule| match_score(rule, model, &tokens).map(|score| (rule, score)))
+        .max_by_key(|(_rule, score)| *score)
+        .map(|(rule, _score)| rule)
 }
 
 fn rate_to_cny(rule: PricingRule, value: f64) -> f64 {
@@ -414,6 +754,132 @@ mod tests {
         );
     }
 
+    fn rule_id_for(model: &str) -> Option<&'static str> {
+        find_rule(Some(model)).map(|rule| rule.id)
+    }
+
+    fn assert_rule_id(model: &str, expected: &'static str) {
+        assert_eq!(rule_id_for(model), Some(expected), "model: {model}");
+    }
+
+    fn expected_usage_cost_usd(
+        input_per_1m: f64,
+        cached_input_per_1m: Option<f64>,
+        cache_creation_input_per_1m: Option<f64>,
+        output_per_1m: f64,
+    ) -> f64 {
+        let cached_input_per_1m = cached_input_per_1m.unwrap_or(input_per_1m);
+        let cache_creation_input_per_1m = cache_creation_input_per_1m.unwrap_or(input_per_1m);
+        let usd = 0.65 * input_per_1m
+            + 0.25 * cached_input_per_1m
+            + 0.10 * cache_creation_input_per_1m
+            + 0.50 * output_per_1m
+            + 0.05 * output_per_1m;
+        usd * STATIC_USD_CNY_RATE_2026_07
+    }
+
+    fn assert_rule_cost(model: &str, expected: f64) {
+        let cost = estimate_model_cost(&usage(Some(model)));
+        assert_eq!(cost.pricing_status, PricingStatus::Rule, "model: {model}");
+        assert_close(cost.estimated_cost, expected);
+    }
+
+    fn test_rule(id: &'static str, priority: u32, model_match: ModelMatch) -> PricingRule {
+        PricingRule {
+            id,
+            priority,
+            model_match,
+            currency: Currency::Usd,
+            input_per_1m: 1.0,
+            output_per_1m: 1.0,
+            cached_input_per_1m: Some(1.0),
+            cache_creation_input_per_1m: Some(1.0),
+            reasoning_output_per_1m: Some(1.0),
+        }
+    }
+
+    fn assert_has_token(tokens: &[String], expected: &str) {
+        assert!(
+            tokens.iter().any(|token| token == expected),
+            "expected token {expected:?} in {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn tokenize_model_preserves_provider_prefixes_versions_and_compact_tokens() {
+        let gpt = tokenize_model("openai/GPT-5.6-Sol-20260709");
+        assert_has_token(&gpt, "openai");
+        assert_has_token(&gpt, "gpt");
+        assert_has_token(&gpt, "5.6");
+        assert_has_token(&gpt, "sol");
+        assert_has_token(&gpt, "20260709");
+
+        let kimi = tokenize_model("moonshot/kimi-k2.6");
+        assert_has_token(&kimi, "kimi");
+        assert_has_token(&kimi, "k2.6");
+        assert_has_token(&kimi, "2.6");
+
+        let qwen = tokenize_model("qwen3-max-latest");
+        assert_has_token(&qwen, "qwen3");
+        assert_has_token(&qwen, "qwen");
+        assert_has_token(&qwen, "3");
+        assert_has_token(&qwen, "max");
+    }
+
+    #[test]
+    fn keyword_match_blocks_forbidden_tokens_and_prefixes() {
+        let rule = test_rule(
+            "gpt-5",
+            100,
+            ModelMatch::Keywords {
+                required: &["gpt", "5"],
+                forbidden: &["mini", "nano", "pro"],
+                forbidden_prefixes: &["5."],
+            },
+        );
+
+        let plain = "gpt-5";
+        let plain_tokens = tokenize_model(plain);
+        assert!(match_score(rule, plain, &plain_tokens).is_some());
+
+        let pro = "gpt-5-pro";
+        let pro_tokens = tokenize_model(pro);
+        assert!(match_score(rule, pro, &pro_tokens).is_none());
+
+        let future = "gpt-5.7";
+        let future_tokens = tokenize_model(future);
+        assert!(match_score(rule, future, &future_tokens).is_none());
+    }
+
+    #[test]
+    fn keyword_match_ranking_prefers_more_specific_rules_over_priority_only() {
+        let generic = test_rule(
+            "gpt-5",
+            200,
+            ModelMatch::Keywords {
+                required: &["gpt", "5"],
+                forbidden: &[],
+                forbidden_prefixes: &[],
+            },
+        );
+        let specific = test_rule(
+            "gpt-5.6-sol",
+            100,
+            ModelMatch::Keywords {
+                required: &["gpt", "5.6", "sol"],
+                forbidden: &[],
+                forbidden_prefixes: &[],
+            },
+        );
+
+        let model = "openai/gpt-5.6-sol-20260709";
+        let tokens = tokenize_model(model);
+        let generic_score = match_score(generic, model, &tokens).expect("generic score");
+        let specific_score = match_score(specific, model, &tokens).expect("specific score");
+
+        assert!(specific_score > generic_score);
+    }
+
     #[test]
     fn matched_model_rule_uses_category_prices() {
         let cost = estimate_model_cost(&usage(Some("gpt-5.5")));
@@ -480,6 +946,135 @@ mod tests {
     }
 
     #[test]
+    fn gpt_5_6_rules_match_tier_keywords_and_reject_unknown_tier() {
+        assert_rule_id("openai/gpt-5.6-sol-20260709", "gpt-5.6-sol");
+        assert_rule_id("GPT 5.6 Sol", "gpt-5.6-sol");
+        assert_rule_id("gpt_5_6_terra", "gpt-5.6-terra");
+        assert_rule_id("gpt-5.6-luna", "gpt-5.6-luna");
+
+        let ambiguous = estimate_model_cost(&usage(Some("gpt 5.6")));
+        assert_eq!(ambiguous.pricing_status, PricingStatus::Fallback);
+        assert_close(ambiguous.estimated_cost, 8.975);
+    }
+
+    #[test]
+    fn gpt_5_6_rules_use_official_standard_prices() {
+        assert_rule_cost(
+            "openai/gpt-5.6-sol-20260709",
+            expected_usage_cost_usd(5.0, Some(0.5), Some(6.25), 30.0),
+        );
+        assert_rule_cost(
+            "gpt-5.6-terra",
+            expected_usage_cost_usd(2.5, Some(0.25), Some(3.125), 15.0),
+        );
+        assert_rule_cost(
+            "gpt-5.6-luna",
+            expected_usage_cost_usd(1.0, Some(0.1), Some(1.25), 6.0),
+        );
+    }
+
+    #[test]
+    fn gpt_5_family_rules_match_known_variants_and_reject_future_versions() {
+        assert_rule_id("gpt-5.5-pro", "gpt-5.5-pro");
+        assert_rule_id("gpt-5.5", "gpt-5.5");
+        assert_rule_id("gpt-5.4-mini", "gpt-5.4-mini");
+        assert_rule_id("gpt-5.4-nano", "gpt-5.4-nano");
+        assert_rule_id("gpt-5.4-pro", "gpt-5.4-pro");
+        assert_rule_id("gpt-5.4", "gpt-5.4");
+        assert_rule_id("gpt-5.2-pro", "gpt-5.2-pro");
+        assert_rule_id("gpt-5.2", "gpt-5.2");
+        assert_rule_id("gpt-5.1", "gpt-5.1");
+        assert_rule_id("gpt-5-pro", "gpt-5-pro");
+        assert_rule_id("gpt-5-mini", "gpt-5-mini");
+        assert_rule_id("gpt-5-nano", "gpt-5-nano");
+        assert_rule_id("gpt-5", "gpt-5");
+
+        assert_eq!(rule_id_for("gpt-5.7"), None);
+        assert_eq!(rule_id_for("gpt-5.7-pro"), None);
+    }
+
+    #[test]
+    fn gpt_5_family_rules_keep_existing_regression_costs() {
+        assert_rule_cost("gpt-5.5", 147.71875);
+        assert_rule_cost("gpt-5.4", 73.859375);
+        assert_rule_cost(
+            "gpt-5.5-pro",
+            expected_usage_cost_usd(30.0, None, None, 180.0),
+        );
+    }
+
+    #[test]
+    fn gpt_4_and_o_series_rules_match_known_variants() {
+        assert_rule_id("gpt-4.1-mini", "gpt-4.1-mini");
+        assert_rule_id("gpt-4.1-nano", "gpt-4.1-nano");
+        assert_rule_id("gpt-4.1", "gpt-4.1");
+        assert_rule_id("gpt-4o-2024-08-06", "gpt-4o");
+        assert_rule_id("gpt-4o-2024-05-13", "gpt-4o-2024-05-13");
+        assert_rule_id("gpt-4o-mini", "gpt-4o-mini");
+        assert_rule_id("gpt-4o-mini-2024-05-13", "gpt-4o-mini");
+        assert_rule_id("gpt-4o", "gpt-4o");
+        assert_rule_id("o1-pro", "o1-pro");
+        assert_rule_id("o1-mini", "o1-mini");
+        assert_rule_id("o1", "o1");
+        assert_rule_id("o3-pro", "o3-pro");
+        assert_rule_id("o3-mini", "o3-mini");
+        assert_rule_id("o3", "o3");
+        assert_rule_id("o4-mini", "o4-mini");
+    }
+
+    #[test]
+    fn gpt_4_and_o_series_rules_use_official_standard_prices() {
+        assert_rule_cost("gpt-4o-mini", expected_usage_cost_usd(0.15, Some(0.075), None, 0.6));
+        assert_rule_cost("o4-mini", expected_usage_cost_usd(1.1, Some(0.275), None, 4.4));
+    }
+
+    #[test]
+    fn existing_provider_rules_match_flexible_ids_and_reject_future_qwen_versions() {
+        assert_rule_id("moonshot/kimi 2.6", "kimi-k2.6");
+        assert_rule_id("kimi-k2.5", "kimi-k2.5");
+        assert_rule_id("google/gemini 2.5 flash", "gemini-2.5-flash");
+        assert_rule_id("gemini-2.5-pro", "gemini-2.5-pro");
+        assert_rule_id("deepseek v4 flash", "deepseek-v4-flash");
+        assert_rule_id("deepseek-v4-pro", "deepseek-v4-pro");
+        assert_rule_id("qwen3-max-latest", "qwen3-max");
+        assert_rule_id("qwen-max-latest", "qwen-max");
+        assert_rule_id("qwen-max-2025-01-25", "qwen-max");
+        assert_rule_id("doubao seed 1.6", "doubao-seed-1.6");
+
+        assert_eq!(rule_id_for("qwen3.5-max"), None);
+        assert_eq!(rule_id_for("qwen4-max"), None);
+        assert_eq!(rule_id_for("qwen10-max"), None);
+        assert_eq!(rule_id_for("qwen-10-max"), None);
+    }
+
+    #[test]
+    fn claude_rules_match_known_models_and_reject_unknown_versions() {
+        assert_rule_id("anthropic/claude-fable-5", "claude-fable-5");
+        assert_rule_id("claude mythos 5", "claude-mythos-5");
+        assert_rule_id("claude-opus-4-8", "claude-opus-4-8");
+        assert_rule_id("claude-opus-4-7", "claude-opus-4-7");
+        assert_rule_id("claude-opus-4-6", "claude-opus-4-6");
+        assert_rule_id("claude-opus-4-5", "claude-opus-4-5");
+        assert_rule_id("anthropic/claude-sonnet-5", "claude-sonnet-5");
+        assert_rule_id("claude sonnet 4.6", "claude-sonnet-4-6");
+        assert_rule_id("claude-sonnet-4-5-20250929", "claude-sonnet-4-5");
+        assert_rule_id("claude-haiku-4-5-20251001", "claude-haiku-4-5");
+        assert_rule_id("claude-haiku-3-5", "claude-haiku-3-5");
+
+        assert_eq!(rule_id_for("claude mythos preview"), None);
+        assert_eq!(rule_id_for("claude sonnet 6"), None);
+        assert_eq!(rule_id_for("claude-sonnet-10"), None);
+    }
+
+    #[test]
+    fn claude_rules_use_official_prices_with_sonnet_5_introductory_until_2026_08_31() {
+        assert_rule_cost("claude-fable-5", expected_usage_cost_usd(10.0, Some(1.0), Some(12.5), 50.0));
+        assert_rule_cost("claude-opus-4-8", expected_usage_cost_usd(5.0, Some(0.5), Some(6.25), 25.0));
+        assert_rule_cost("claude-sonnet-5", expected_usage_cost_usd(2.0, Some(0.2), Some(2.5), 10.0));
+        assert_rule_cost("claude-haiku-4-5", expected_usage_cost_usd(1.0, Some(0.1), Some(1.25), 5.0));
+    }
+
+    #[test]
     fn verified_usd_rules_are_converted_to_cny() {
         let deepseek = estimate_model_cost(&usage(Some("deepseek-v4-flash")));
         let gemini = estimate_model_cost(&usage(Some("gemini-2.5-flash")));
@@ -502,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_model_uses_average_fallback() {
+    fn unknown_model_uses_component_fallback_rates() {
         let cost = estimate_model_cost(&usage(Some("unknown-internal-model")));
 
         assert_eq!(cost.pricing_status, PricingStatus::Fallback);
@@ -510,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_model_uses_average_fallback() {
+    fn missing_model_uses_component_fallback_rates() {
         let cost = estimate_model_cost(&usage(None));
 
         assert_eq!(cost.pricing_status, PricingStatus::Fallback);
