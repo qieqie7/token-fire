@@ -17,7 +17,9 @@ use crate::core::profile::{
     PeriodProfileSummary, ProfileCostDrivers, ProfileDayBucket, ProfilePeakDay, ProfilePeriod,
     ProfileSummary, RankedProfileBreakdown, YearProfileSummary,
 };
-use crate::core::profile_rollup::{bucket_start_utc, normalize_model_key};
+use crate::core::profile_rollup::{
+    bucket_start_utc, normalize_model_key, PROFILE_ROLLUP_BUCKET_SECONDS,
+};
 use crate::core::usage_series::{
     average_tokens_per_bucket, bucket_index_for, empty_usage_buckets, WidgetUsageSeries,
     WIDGET_USAGE_ACTIVE_THRESHOLD_MINUTES, WIDGET_USAGE_WINDOW_MINUTES,
@@ -360,30 +362,58 @@ impl UsageStore {
             }
         }
 
+        // raw 删除用 `?` 传播：raw 是唯一事实源，其删除失败是真实存储故障，必须整体 abort，
+        // 不推进 last_success_at（与 rollup 维护失败的降级路径严格区分）。
+        let deleted_observations = tx.execute(
+            "delete from token_observations where observed_at < ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
+
+        // Ready 模式在同事务内维护 rollup 边界桶；invalid 模式只维护 raw、保持 rollup invalid。
+        if rollup_state(&tx)?.as_deref() != Some(ROLLUP_STATE_INVALID) {
+            // OVERRIDE D：rollup 是派生模型，其边界维护失败不能丢失已删除的 raw retention。
+            // 不用 `?` 传播——捕获错误后回滚组合事务，改走 raw-only 降级并翻转 invalid。
+            if maintain_rollup_boundary(&tx, cutoff).is_err() {
+                drop(tx);
+                return self.run_retention_raw_only_degraded(now, cutoff);
+            }
+        }
+
+        write_retention_metadata(&tx, now, deleted_observations)?;
+        tx.commit()?;
+
+        Ok(RetentionOutcome {
+            ran: true,
+            cutoff,
+            deleted_observations,
+            skipped_reason: None,
+        })
+    }
+
+    /// OVERRIDE D 降级路径：rollup 边界重建失败、组合事务已回滚后调用。
+    /// 新事务只做 raw retention 并把 rollup 标记 invalid（等待 Task 5 完整重建），
+    /// 保证 raw 删除与 last_success_at 仍然持久化；旧 rollup 不再参与查询。
+    fn run_retention_raw_only_degraded(
+        &mut self,
+        now: DateTime<Utc>,
+        cutoff: DateTime<Utc>,
+    ) -> anyhow::Result<RetentionOutcome> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let deleted_observations = tx.execute(
             "delete from token_observations where observed_at < ?1",
             params![cutoff.to_rfc3339()],
         )?;
         tx.execute(
             r#"
-            insert into retention_state (key, value)
-            values ('last_success_at', ?1)
+            insert into usage_rollup_metadata (key, value)
+            values (?1, ?2)
             on conflict(key) do update set value = excluded.value
             "#,
-            params![now.to_rfc3339()],
+            params![ROLLUP_METADATA_STATE_KEY, ROLLUP_STATE_INVALID],
         )?;
-        tx.execute(
-            r#"
-            insert into retention_state (key, value)
-            values ('last_deleted_observations', ?1)
-            on conflict(key) do update set value = excluded.value
-            "#,
-            params![deleted_observations.to_string()],
-        )?;
-        tx.execute(
-            "delete from retention_state where key in ('last_failure_at', 'last_error_kind')",
-            [],
-        )?;
+        write_retention_metadata(&tx, now, deleted_observations)?;
         tx.commit()?;
 
         Ok(RetentionOutcome {
@@ -1194,6 +1224,93 @@ fn rollup_state(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<Option<String>
     )
     .optional()
     .map_err(Into::into)
+}
+
+/// 写 retention 成功元数据：推进 last_success_at、记录本次删除数、清理失败标记。
+/// 抽成独立函数供 Ready 主路径与 raw-only 降级路径共用，避免两处口径漂移。
+fn write_retention_metadata(
+    tx: &rusqlite::Transaction<'_>,
+    now: DateTime<Utc>,
+    deleted_observations: usize,
+) -> anyhow::Result<()> {
+    tx.execute(
+        r#"
+        insert into retention_state (key, value)
+        values ('last_success_at', ?1)
+        on conflict(key) do update set value = excluded.value
+        "#,
+        params![now.to_rfc3339()],
+    )?;
+    tx.execute(
+        r#"
+        insert into retention_state (key, value)
+        values ('last_deleted_observations', ?1)
+        on conflict(key) do update set value = excluded.value
+        "#,
+        params![deleted_observations.to_string()],
+    )?;
+    tx.execute(
+        "delete from retention_state where key in ('last_failure_at', 'last_error_kind')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Ready 模式 rollup 边界维护（在 raw 删除后、metadata 更新前于同事务内执行）。
+///
+/// cutoff 无需 15 分钟对齐；用 `bucket_start_utc` 取 cutoff 所属桶起点，与增量写入对齐。
+/// 步骤：删除完全过期桶（< cutoff_bucket）→ 删除旧边界聚合（= cutoff_bucket）→
+/// 从保留的 tracked raw rows（raw 删除已剔除 < cutoff 的行）重建 `[cutoff_bucket, cutoff_bucket+900)`。
+/// 重建 SELECT 复用 `upsert_profile_rollup` 相同的 billable/unattributed CASE 表达式，
+/// 保证增量 upsert / full rebuild / retention rebuild 同一数值域。整数域运算，不得转 REAL。
+fn maintain_rollup_boundary(
+    tx: &rusqlite::Transaction<'_>,
+    cutoff: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let cutoff_bucket = bucket_start_utc(cutoff);
+    let boundary_end = cutoff_bucket + PROFILE_ROLLUP_BUCKET_SECONDS;
+
+    // 删除完全过期桶与旧边界聚合（<= cutoff_bucket）。
+    tx.execute(
+        "delete from usage_rollups_15m where bucket_start_utc <= ?1",
+        params![cutoff_bucket],
+    )?;
+
+    // 从保留 raw 行重建边界桶：观测落在半开窗口 [cutoff_bucket, cutoff_bucket+900)，
+    // 仅统计 tracked（tracking_window_id is not null）行；raw 删除已剔除 < cutoff 的贡献。
+    // 时间戳用 strftime('%s') 转 unix 秒后再 floor 到桶，避免依赖 rfc3339 字符串比较。
+    tx.execute(
+        r#"
+        insert into usage_rollups_15m (
+          bucket_start_utc, source, model,
+          input_tokens, billable_uncached_input_tokens, output_tokens,
+          cached_input_tokens, cache_creation_input_tokens, reasoning_output_tokens,
+          unattributed_total_tokens, total_tokens, observation_count
+        )
+        select
+          ?1 as bucket_start_utc,
+          source,
+          coalesce(model, '') as model,
+          sum(input_tokens),
+          sum(max(input_tokens - cached_input_tokens - cache_creation_input_tokens, 0)),
+          sum(output_tokens),
+          sum(cached_input_tokens),
+          sum(cache_creation_input_tokens),
+          sum(reasoning_output_tokens),
+          sum(case when input_tokens = 0 and output_tokens = 0 and cached_input_tokens = 0
+                    and cache_creation_input_tokens = 0 and reasoning_output_tokens = 0
+                   then max(total_tokens, 0) else 0 end),
+          sum(total_tokens),
+          count(*)
+        from token_observations
+        where tracking_window_id is not null
+          and cast(strftime('%s', observed_at) as integer) >= ?1
+          and cast(strftime('%s', observed_at) as integer) < ?2
+        group by source, coalesce(model, '')
+        "#,
+        params![cutoff_bucket, boundary_end],
+    )?;
+    Ok(())
 }
 
 /// 写入 raw observation（唯一事实源）。封装原 23 列 insert-or-ignore，列映射保持不变。

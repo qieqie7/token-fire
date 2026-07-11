@@ -6,6 +6,7 @@ use tempfile::tempdir;
 use token_fire::core::observation::{NormalizedObservation, SourceRecordIdConfidence};
 use token_fire::core::pricing::{PricingStatus, DEFAULT_AVERAGE_CNY_PER_1M_TOKENS};
 use token_fire::core::profile::{ProfilePeriod, ProfileSummary, RankedProfileBreakdown};
+use token_fire::core::profile_rollup::bucket_start_utc;
 use token_fire::core::usage_series::{WIDGET_USAGE_BUCKET_MINUTES, WIDGET_USAGE_WINDOW_MINUTES};
 use token_fire::core::usage_store::{
     InsertOutcome, RetentionPolicy, RetentionSkipReason, UsageStore,
@@ -1011,6 +1012,174 @@ fn retention_failure_diagnostics_do_not_change_success_state() {
         diagnostics.last_error_kind,
         Some("sqlite_retention_failed".to_string())
     );
+}
+
+// 主用例：非 15 分钟对齐的 cutoff，边界桶必须只保留 cutoff 后贡献。
+// 观测布置：边界桶前（完全过期）/ cutoff 前但在边界桶内（应从边界剔除）/ cutoff 后在边界桶内（应保留）/ 远期（不受影响）。
+#[test]
+fn retention_rebuilds_profile_rollup_boundary_keeps_only_post_cutoff() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+
+    // now 故意带 7 分 33 秒，使 cutoff 不落在 15 分钟边界。
+    let now = Utc.with_ymd_and_hms(2026, 6, 26, 12, 7, 33).unwrap();
+    let cutoff = now - chrono::Duration::days(365);
+    assert_ne!(
+        bucket_start_utc(cutoff),
+        cutoff.timestamp(),
+        "cutoff 应非对齐"
+    );
+    let cutoff_bucket = bucket_start_utc(cutoff);
+
+    let expired = Utc.with_ymd_and_hms(2025, 6, 26, 11, 50, 0).unwrap();
+    let pruned = Utc.with_ymd_and_hms(2025, 6, 26, 12, 3, 0).unwrap();
+    let retained = Utc.with_ymd_and_hms(2025, 6, 26, 12, 10, 0).unwrap();
+    let recent = Utc.with_ymd_and_hms(2026, 6, 25, 12, 7, 33).unwrap();
+    let expired_bucket = bucket_start_utc(expired);
+    let recent_bucket = bucket_start_utc(recent);
+
+    insert_tracked(&store, &observation("expired", 1000, expired)).unwrap();
+    insert_tracked(&store, &observation("pruned", 200, pruned)).unwrap();
+    insert_tracked(&store, &observation("retained", 77, retained)).unwrap();
+    insert_tracked(&store, &observation("recent", 5000, recent)).unwrap();
+
+    let outcome = store
+        .run_retention_if_due(now, RetentionPolicy::default())
+        .unwrap();
+
+    // cutoff 前 raw 被删除（expired + pruned）。
+    assert!(outcome.ran);
+    assert_eq!(outcome.deleted_observations, 2);
+    assert_eq!(observation_count(&db_path), 2);
+
+    let rows = rollup_rows(&db_path);
+    // 完全过期 rollup 桶被删除。
+    assert!(
+        rows.iter()
+            .all(|row| row.bucket_start_utc != expired_bucket),
+        "完全过期桶应被删除"
+    );
+    // 远期桶不受影响。
+    let recent_row = rows
+        .iter()
+        .find(|row| row.bucket_start_utc == recent_bucket)
+        .expect("远期桶应保留");
+    assert_eq!(recent_row.total_tokens, 5000);
+
+    // 边界桶只保留 cutoff 后贡献（仅 retained=77）。
+    let boundary = rows
+        .iter()
+        .find(|row| row.bucket_start_utc == cutoff_bucket)
+        .expect("边界桶应存在且已重建");
+    assert_eq!(boundary.source, "traex");
+    assert_eq!(boundary.model, "model-a");
+    assert_eq!(boundary.total_tokens, 77);
+    assert_eq!(boundary.input_tokens, 77);
+    assert_eq!(boundary.billable_uncached_input_tokens, 77);
+    assert_eq!(boundary.output_tokens, 0);
+    assert_eq!(boundary.unattributed_total_tokens, 0);
+    assert_eq!(boundary.observation_count, 1);
+
+    // retention metadata 与 raw/rollup 修改同事务提交。
+    assert_eq!(
+        state_value(&db_path, "last_success_at"),
+        Some(now.to_rfc3339())
+    );
+    // Ready 模式不翻转 state。
+    assert_eq!(rollup_metadata_value(&db_path, "state"), None);
+}
+
+// OVERRIDE D：rollup 边界维护失败时，raw 删除与 last_success_at 仍需持久化，rollup 降级为 invalid。
+#[test]
+fn retention_rebuilds_profile_rollup_boundary_degrades_on_rollup_failure() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+
+    let now = Utc.with_ymd_and_hms(2026, 6, 26, 12, 7, 33).unwrap();
+    let expired = Utc.with_ymd_and_hms(2025, 6, 26, 11, 50, 0).unwrap();
+    let retained = Utc.with_ymd_and_hms(2025, 6, 26, 12, 10, 0).unwrap();
+
+    // 先插入观测让增量 rollup 正常写入，再安装失败触发器只影响 retention 的重建 INSERT。
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_tracked(&store, &observation("expired", 1000, expired)).unwrap();
+    insert_tracked(&store, &observation("retained", 77, retained)).unwrap();
+    drop(store);
+
+    Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            r#"
+            create trigger fail_rollup_boundary_rebuild
+            before insert on usage_rollups_15m
+            begin
+              select raise(fail, 'rollup boundary rebuild failed');
+            end;
+            "#,
+        )
+        .unwrap();
+
+    let mut store = UsageStore::open(&db_path).unwrap();
+    let outcome = store
+        .run_retention_if_due(now, RetentionPolicy::default())
+        .unwrap();
+
+    // raw 删除仍生效（expired 被删，retained 保留），last_success_at 前进，rollup 降级 invalid。
+    assert!(outcome.ran);
+    assert_eq!(outcome.deleted_observations, 1);
+    assert_eq!(observation_count(&db_path), 1);
+    assert_eq!(
+        state_value(&db_path, "last_success_at"),
+        Some(now.to_rfc3339())
+    );
+    assert_eq!(
+        rollup_metadata_value(&db_path, "state"),
+        Some("invalid".to_string())
+    );
+}
+
+// Invalid 模式：Retention 只维护 raw，保持 rollup invalid，不做边界重建。
+#[test]
+fn retention_rebuilds_profile_rollup_boundary_invalid_mode_is_raw_only() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    UsageStore::open(&db_path).unwrap();
+
+    // 预置 state=invalid：后续 tracked insert 走 raw-only 降级，rollup 不写。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "insert into usage_rollup_metadata (key, value) values ('state', 'invalid')",
+            [],
+        )
+        .unwrap();
+
+    let now = Utc.with_ymd_and_hms(2026, 6, 26, 12, 7, 33).unwrap();
+    let expired = Utc.with_ymd_and_hms(2025, 6, 26, 11, 50, 0).unwrap();
+    let retained = Utc.with_ymd_and_hms(2025, 6, 26, 12, 10, 0).unwrap();
+
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_tracked(&store, &observation("expired", 1000, expired)).unwrap();
+    insert_tracked(&store, &observation("retained", 77, retained)).unwrap();
+    assert_eq!(rollup_row_count(&db_path), 0, "invalid 模式不写 rollup");
+
+    let outcome = store
+        .run_retention_if_due(now, RetentionPolicy::default())
+        .unwrap();
+
+    // raw 被裁剪，state 保持 invalid，不重建任何 rollup 桶。
+    assert!(outcome.ran);
+    assert_eq!(outcome.deleted_observations, 1);
+    assert_eq!(observation_count(&db_path), 1);
+    assert_eq!(
+        state_value(&db_path, "last_success_at"),
+        Some(now.to_rfc3339())
+    );
+    assert_eq!(
+        rollup_metadata_value(&db_path, "state"),
+        Some("invalid".to_string())
+    );
+    assert_eq!(rollup_row_count(&db_path), 0);
 }
 
 #[test]
