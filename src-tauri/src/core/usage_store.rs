@@ -13,9 +13,9 @@ use crate::core::pricing::{
     ModelTokenUsage, WidgetCostSummary,
 };
 use crate::core::profile::{
-    intensity_for_cost, model_label, period_bounds, source_label, PeriodProfileSummary,
-    ProfileCostDrivers, ProfileDayBucket, ProfilePeakDay, ProfilePeriod, ProfileSummary,
-    RankedProfileBreakdown, YearProfileSummary,
+    empty_period_usage_trend, intensity_for_cost, model_label, period_bounds, source_label,
+    PeriodProfileSummary, ProfileCostDrivers, ProfileDayBucket, ProfilePeakDay, ProfilePeriod,
+    ProfileSummary, RankedProfileBreakdown, YearProfileSummary,
 };
 use crate::core::usage_series::{
     average_tokens_per_bucket, bucket_index_for, empty_usage_buckets, WidgetUsageSeries,
@@ -887,6 +887,25 @@ impl UsageStore {
         }
     }
 
+    fn period_usage_trend(
+        period: ProfilePeriod,
+        rows: &[PricedProfileObservationRow],
+        now_utc: DateTime<Utc>,
+        now_local: DateTime<Local>,
+    ) -> anyhow::Result<crate::core::profile::PeriodUsageTrend> {
+        let mut trend = empty_period_usage_trend(period, now_utc, now_local)?;
+        for row in rows {
+            if let Some(bucket) = trend.buckets.iter_mut().find(|bucket| {
+                row.observed_at >= bucket.started_at && row.observed_at < bucket.ended_at
+            }) {
+                if let Some(total_tokens) = bucket.total_tokens.as_mut() {
+                    *total_tokens += row.total_tokens;
+                }
+            }
+        }
+        Ok(trend)
+    }
+
     pub fn profile_summary_at(
         &self,
         period: ProfilePeriod,
@@ -904,6 +923,7 @@ impl UsageStore {
         let period_rows = Self::priced_rows(&self.profile_rows_between(period_start, period_end)?);
         let period_estimated_cost: f64 = period_rows.iter().map(|row| row.estimated_cost).sum();
         let period_total_tokens: i64 = period_rows.iter().map(|row| row.total_tokens).sum();
+        let trend = Self::period_usage_trend(period, &period_rows, now_utc, now_local)?;
 
         Ok(ProfileSummary {
             generated_at: now_utc,
@@ -915,6 +935,7 @@ impl UsageStore {
                 ended_at: period_end,
                 estimated_cost: period_estimated_cost,
                 total_tokens: period_total_tokens,
+                trend,
                 model_breakdown: Self::ranked_breakdown(&period_rows, |row| {
                     let label = model_label(row.model.as_deref());
                     let key = if label == "Unknown" {

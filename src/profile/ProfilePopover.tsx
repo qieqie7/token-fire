@@ -2,6 +2,7 @@ import type { BuildIdentity, ProfilePeriod, ProfileSummary, ReleaseUpdateStatus 
 import { AppSources } from "./AppSources";
 import { MetricPair } from "./MetricPair";
 import { PeriodFilter } from "./PeriodFilter";
+import { PeriodTrendChart } from "./PeriodTrendChart";
 import { TopModels } from "./TopModels";
 import { YearHeatmap } from "./YearHeatmap";
 import "./profile.css";
@@ -101,6 +102,7 @@ export function ProfilePopover({
         <span>{loading ? "加载中" : error ? "不可用" : "筛选下方数据"}</span>
       </div>
       <PeriodFilter period={period} onChange={onPeriodChange} />
+      <PeriodTrendChart trend={selectedPeriod?.trend} />
       <MetricPair period={selectedPeriod} />
       <div className="profile-attribution-grid">
         <AppSources rows={selectedPeriod?.source_breakdown ?? []} />

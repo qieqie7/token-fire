@@ -42,7 +42,7 @@ describe("Tauri profile window config", () => {
     const mainWindow = config.app?.windows?.find((window) => window.title === "TokenFire");
 
     expect(mainWindow?.width).toBe(428);
-    expect(mainWindow?.height).toBe(572);
+    expect(mainWindow?.height).toBe(690);
     expect(mainWindow?.label).toBe("main");
     expect(mainWindow?.decorations).toBe(false);
     expect(mainWindow?.transparent).toBe(true);

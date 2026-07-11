@@ -5,7 +5,7 @@
   min-height: 0;
   overflow: hidden;
   display: grid;
-  grid-template-rows: auto auto auto auto auto 1fr;
+  grid-template-rows: auto auto auto auto auto auto 1fr;
   gap: 10px;
   padding: 14px 16px;
   background: var(--color-surface-widget);
@@ -214,6 +214,62 @@
   color: #1c1008;
   background: #ff8a34;
   font-weight: 760;
+}
+
+.profile-trend {
+  min-width: 0;
+  padding: 9px 10px 8px;
+}
+
+.profile-trend__chart {
+  position: relative;
+  aspect-ratio: 320 / 74;
+  margin-top: 6px;
+}
+
+.profile-trend__svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  overflow: visible;
+}
+
+.profile-trend__baseline {
+  stroke: rgba(255, 255, 255, 0.12);
+  stroke-width: 1;
+}
+
+.profile-trend__line {
+  fill: none;
+  stroke: #ff8a34;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.profile-trend__point {
+  fill: transparent;
+}
+
+.profile-trend__endpoint {
+  fill: #ff8a34;
+  stroke: var(--color-surface-widget);
+  stroke-width: 2.5;
+}
+
+.profile-trend__empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  pointer-events: none;
+}
+
+.profile-trend__tick {
+  fill: var(--color-text-secondary);
+  font-size: 9px;
 }
 
 .profile-attribution-grid {

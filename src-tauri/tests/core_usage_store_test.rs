@@ -1366,6 +1366,198 @@ fn profile_period_totals_match_breakdown_totals() {
 }
 
 #[test]
+fn profile_trend_today_uses_24_hour_buckets_and_future_nulls() {
+    let dir = tempdir().unwrap();
+    let store = UsageStore::open(&dir.path().join("token-fire.sqlite")).unwrap();
+    let now_local = Local
+        .with_ymd_and_hms(2026, 7, 4, 12, 30, 0)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+
+    insert_tracked(
+        &store,
+        &cost_observation(
+            "trend-today-early",
+            Some("gpt-5.5"),
+            0,
+            0,
+            0,
+            0,
+            0,
+            2_000_000,
+            now_local
+                .date_naive()
+                .and_hms_opt(2, 10, 0)
+                .unwrap()
+                .and_local_timezone(Local)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc),
+        ),
+    )
+    .unwrap();
+    insert_tracked(
+        &store,
+        &cost_observation(
+            "trend-today-current",
+            Some("gpt-5.5"),
+            0,
+            0,
+            0,
+            0,
+            0,
+            3_000_000,
+            now_local
+                .date_naive()
+                .and_hms_opt(12, 5, 0)
+                .unwrap()
+                .and_local_timezone(Local)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc),
+        ),
+    )
+    .unwrap();
+
+    let summary = store
+        .profile_summary_at(ProfilePeriod::Today, now_utc, now_local)
+        .unwrap();
+    let trend = &summary.selected_period.trend;
+
+    assert_eq!(trend.unit, token_fire::core::profile::PeriodTrendUnit::Hour);
+    assert_eq!(trend.buckets.len(), 24);
+    assert_eq!(
+        trend
+            .x_ticks
+            .iter()
+            .map(|tick| tick.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["0", "6", "12", "18", "23"]
+    );
+    assert_eq!(trend.buckets[2].total_tokens, Some(2_000_000));
+    assert_eq!(trend.buckets[3].total_tokens, Some(0));
+    assert_eq!(trend.buckets[12].total_tokens, Some(3_000_000));
+    assert_eq!(trend.buckets[13].total_tokens, None);
+    assert!(trend.buckets[13].is_future);
+    assert_eq!(summary.selected_period.ended_at, now_utc);
+    assert_eq!(
+        trend
+            .buckets
+            .last()
+            .unwrap()
+            .ended_at
+            .with_timezone(&Local)
+            .date_naive(),
+        now_local.date_naive() + chrono::Days::new(1)
+    );
+    assert_eq!(
+        trend
+            .buckets
+            .iter()
+            .filter_map(|bucket| bucket.total_tokens)
+            .sum::<i64>(),
+        summary.selected_period.total_tokens
+    );
+}
+
+#[test]
+fn profile_trend_week_month_and_year_use_calendar_ticks() {
+    let dir = tempdir().unwrap();
+    let store = UsageStore::open(&dir.path().join("token-fire.sqlite")).unwrap();
+    let now_local = Local
+        .with_ymd_and_hms(2026, 7, 8, 12, 0, 0)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+
+    let week = store
+        .profile_summary_at(ProfilePeriod::ThisWeek, now_utc, now_local)
+        .unwrap();
+    let month = store
+        .profile_summary_at(ProfilePeriod::ThisMonth, now_utc, now_local)
+        .unwrap();
+    let year = store
+        .profile_summary_at(ProfilePeriod::ThisYear, now_utc, now_local)
+        .unwrap();
+
+    assert_eq!(week.selected_period.trend.buckets.len(), 7);
+    assert_eq!(week.selected_period.ended_at, now_utc);
+    assert_eq!(
+        week.selected_period
+            .trend
+            .x_ticks
+            .iter()
+            .map(|tick| tick.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["一", "二", "三", "四", "五", "六", "日"]
+    );
+    assert_eq!(week.selected_period.trend.buckets[0].total_tokens, Some(0));
+    assert_eq!(week.selected_period.trend.buckets[3].total_tokens, None);
+    assert_eq!(
+        week.selected_period
+            .trend
+            .buckets
+            .last()
+            .unwrap()
+            .ended_at
+            .with_timezone(&Local)
+            .weekday(),
+        chrono::Weekday::Mon
+    );
+
+    assert_eq!(month.selected_period.trend.buckets.len(), 31);
+    assert_eq!(
+        month
+            .selected_period
+            .trend
+            .x_ticks
+            .iter()
+            .map(|tick| tick.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["1", "10", "20", "月末"]
+    );
+    assert_eq!(month.selected_period.trend.buckets[7].total_tokens, Some(0));
+    assert_eq!(month.selected_period.trend.buckets[8].total_tokens, None);
+    assert_eq!(
+        month
+            .selected_period
+            .trend
+            .buckets
+            .last()
+            .unwrap()
+            .ended_at
+            .with_timezone(&Local)
+            .day(),
+        1
+    );
+
+    assert_eq!(year.selected_period.trend.buckets.len(), 12);
+    assert_eq!(
+        year.selected_period
+            .trend
+            .x_ticks
+            .iter()
+            .map(|tick| tick.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["1", "4", "7", "10", "12月"]
+    );
+    assert_eq!(year.selected_period.trend.buckets[6].total_tokens, Some(0));
+    assert_eq!(year.selected_period.trend.buckets[7].total_tokens, None);
+    assert_eq!(
+        year.selected_period
+            .trend
+            .buckets
+            .last()
+            .unwrap()
+            .ended_at
+            .with_timezone(&Local)
+            .month(),
+        1
+    );
+}
+
+#[test]
 fn profile_period_breakdowns_include_other_bucket_when_more_than_ten_groups() {
     let dir = tempdir().unwrap();
     let store = UsageStore::open(&dir.path().join("token-fire.sqlite")).unwrap();

@@ -36,16 +36,28 @@ describe("profile css", () => {
     const profileList = cssBlock(css, ".profile-list");
     const profileSources = cssBlock(css, ".profile-sources");
     const rankedTrack = cssBlock(css, ".profile-ranked-row__track");
+    const trend = cssBlock(css, ".profile-trend");
+    const trendChart = cssBlock(css, ".profile-trend__chart");
+    const trendLine = cssBlock(css, ".profile-trend__line");
+    const trendEndpoint = cssBlock(css, ".profile-trend__endpoint");
 
     expect(popover).toContain("height: 100vh;");
     expect(popover).toContain("overflow: hidden;");
+    expect(popover).toContain("grid-template-rows: auto auto auto auto auto auto 1fr;");
     expect(metricGrid).toContain("grid-template-columns: 1.3fr 0.9fr;");
     expect(attributionGrid).toContain("grid-template-columns: 0.9fr 1.3fr;");
     expect(profileList).toContain("height: 100%;");
     expect(profileSources).toContain("height: 100%;");
     expect(rankedTrack).toContain("height: 5px;");
+    expect(trend).toContain("padding: 9px 10px 8px;");
+    expect(trendChart).toContain("aspect-ratio: 320 / 74;");
+    expect(trendLine).toContain("stroke: #ff8a34;");
+    expect(trendEndpoint).toContain("fill: #ff8a34;");
     expect(css).not.toContain("height: 198px;");
     expect(css).not.toContain("overflow-y: auto");
+    expect(css).not.toContain(".profile-trend__ticks");
+    expect(css).not.toContain(".profile-trend__ticks span:first-child");
+    expect(css).not.toContain(".profile-trend__ticks span:last-child");
   });
 
   it("keeps the Profile version mark compact in the header", () => {

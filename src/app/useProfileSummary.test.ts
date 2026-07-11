@@ -18,6 +18,32 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(),
 }));
 
+const trend: ProfileSummary["selected_period"]["trend"] = {
+  unit: "day",
+  buckets: [
+    {
+      key: "d01",
+      label: "1",
+      started_at: "2026-07-01T00:00:00Z",
+      ended_at: "2026-07-02T00:00:00Z",
+      total_tokens: 19_800_000,
+      is_future: false,
+    },
+    {
+      key: "d02",
+      label: "2",
+      started_at: "2026-07-02T00:00:00Z",
+      ended_at: "2026-07-03T00:00:00Z",
+      total_tokens: null,
+      is_future: true,
+    },
+  ],
+  x_ticks: [
+    { bucket_key: "d01", label: "1" },
+    { bucket_key: "d02", label: "月末" },
+  ],
+};
+
 const summary: ProfileSummary = {
   generated_at: "2026-07-04T12:00:00Z",
   currency: "CNY",
@@ -44,6 +70,7 @@ const summary: ProfileSummary = {
     ended_at: "2026-07-04T12:00:00Z",
     estimated_cost: 128.42,
     total_tokens: 19_800_000,
+    trend,
     model_breakdown: [
       { key: "gpt-5.5", label: "GPT-5.5", estimated_cost: 62, total_tokens: 8_000_000, share: 0.48 },
     ],

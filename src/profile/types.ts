@@ -43,9 +43,30 @@ export interface PeriodProfileSummary {
   ended_at: string;
   estimated_cost: number;
   total_tokens: number;
+  trend: PeriodUsageTrend;
   model_breakdown: RankedProfileBreakdown[];
   source_breakdown: RankedProfileBreakdown[];
   cost_drivers: ProfileCostDrivers;
+}
+
+export interface PeriodUsageTrend {
+  unit: "hour" | "day" | "month";
+  buckets: PeriodUsageTrendBucket[];
+  x_ticks: PeriodUsageTrendTick[];
+}
+
+export interface PeriodUsageTrendBucket {
+  key: string;
+  label: string;
+  started_at: string;
+  ended_at: string;
+  total_tokens: number | null;
+  is_future: boolean;
+}
+
+export interface PeriodUsageTrendTick {
+  bucket_key: string;
+  label: string;
 }
 
 export interface RankedProfileBreakdown {

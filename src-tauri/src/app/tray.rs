@@ -162,7 +162,7 @@ pub fn handle_menu_action_outcome<R: Runtime>(
 }
 
 const PROFILE_WINDOW_WIDTH: f64 = 428.0;
-const PROFILE_WINDOW_HEIGHT: f64 = 572.0;
+const PROFILE_WINDOW_HEIGHT: f64 = 690.0;
 const PROFILE_WINDOW_GAP: f64 = 8.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -688,7 +688,7 @@ mod tests {
         );
 
         assert_eq!(position.x, 798.0);
-        assert_eq!(position.y, 328.0);
+        assert_eq!(position.y, 210.0);
     }
 
     #[test]
