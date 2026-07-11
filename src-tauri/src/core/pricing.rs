@@ -43,6 +43,24 @@ pub struct ModelTokenUsage {
     pub total_tokens: i64,
 }
 
+/// 15 分钟 rollup 桶的聚合定价入参。
+///
+/// 与 `ModelTokenUsage` 的关键差异：`billable_uncached_input_tokens` 和
+/// `unattributed_total_tokens` 都是逐行预聚合量。聚合定价必须直接使用它们，
+/// 不得再从分量 clamp 或由 `total_tokens` 反推——否则与 raw 逐行定价不等价。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregatedModelTokenUsage {
+    pub model: Option<String>,
+    pub input_tokens: i64,
+    pub billable_uncached_input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub cache_creation_input_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub unattributed_total_tokens: i64,
+    pub total_tokens: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PricedModelCost {
     pub estimated_cost: f64,
@@ -192,242 +210,618 @@ const PRICING_RULES: &[PricingRule] = &[
         Some(1.25),
         6.00,
     ),
-    usd_rule("gpt-5.5-pro", 157, ModelMatch::Keywords {
-        required: &["gpt", "5.5", "pro"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 30.00, None, None, 180.00),
-    usd_rule("gpt-5.5", 156, ModelMatch::Keywords {
-        required: &["gpt", "5.5"],
-        forbidden: &["pro"],
-        forbidden_prefixes: &[],
-    }, 5.00, Some(0.50), None, 30.00),
-    usd_rule("gpt-5.4-pro", 155, ModelMatch::Keywords {
-        required: &["gpt", "5.4", "pro"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 30.00, None, None, 180.00),
-    usd_rule("gpt-5.4-mini", 154, ModelMatch::Keywords {
-        required: &["gpt", "5.4", "mini"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 0.75, Some(0.075), None, 4.50),
-    usd_rule("gpt-5.4-nano", 153, ModelMatch::Keywords {
-        required: &["gpt", "5.4", "nano"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 0.20, Some(0.02), None, 1.25),
-    usd_rule("gpt-5.4", 152, ModelMatch::Keywords {
-        required: &["gpt", "5.4"],
-        forbidden: &["mini", "nano", "pro"],
-        forbidden_prefixes: &[],
-    }, 2.50, Some(0.25), None, 15.00),
-    usd_rule("gpt-5.2-pro", 151, ModelMatch::Keywords {
-        required: &["gpt", "5.2", "pro"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 21.00, None, None, 168.00),
-    usd_rule("gpt-5.2", 150, ModelMatch::Keywords {
-        required: &["gpt", "5.2"],
-        forbidden: &["pro"],
-        forbidden_prefixes: &[],
-    }, 1.75, Some(0.175), None, 14.00),
-    usd_rule("gpt-5.1", 149, ModelMatch::Keywords {
-        required: &["gpt", "5.1"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 1.25, Some(0.125), None, 10.00),
-    usd_rule("gpt-5-pro", 148, ModelMatch::Keywords {
-        required: &["gpt", "5", "pro"],
-        forbidden: &[],
-        forbidden_prefixes: &["5."],
-    }, 15.00, None, None, 120.00),
-    usd_rule("gpt-5-mini", 147, ModelMatch::Keywords {
-        required: &["gpt", "5", "mini"],
-        forbidden: &[],
-        forbidden_prefixes: &["5."],
-    }, 0.25, Some(0.025), None, 2.00),
-    usd_rule("gpt-5-nano", 146, ModelMatch::Keywords {
-        required: &["gpt", "5", "nano"],
-        forbidden: &[],
-        forbidden_prefixes: &["5."],
-    }, 0.05, Some(0.005), None, 0.40),
-    usd_rule("gpt-5", 145, ModelMatch::Keywords {
-        required: &["gpt", "5"],
-        forbidden: &["mini", "nano", "pro"],
-        forbidden_prefixes: &["5."],
-    }, 1.25, Some(0.125), None, 10.00),
-    usd_rule("gpt-4.1-mini", 144, ModelMatch::Keywords {
-        required: &["gpt", "4.1", "mini"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 0.40, Some(0.10), None, 1.60),
-    usd_rule("gpt-4.1-nano", 143, ModelMatch::Keywords {
-        required: &["gpt", "4.1", "nano"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 0.10, Some(0.025), None, 0.40),
-    usd_rule("gpt-4.1", 142, ModelMatch::Keywords {
-        required: &["gpt", "4.1"],
-        forbidden: &["mini", "nano"],
-        forbidden_prefixes: &[],
-    }, 2.00, Some(0.50), None, 8.00),
-    usd_rule("gpt-4o-2024-05-13", 141, ModelMatch::Keywords {
-        required: &["gpt", "4o", "2024", "05", "13"],
-        forbidden: &["mini"],
-        forbidden_prefixes: &[],
-    }, 5.00, None, None, 15.00),
-    usd_rule("gpt-4o-mini", 140, ModelMatch::Keywords {
-        required: &["gpt", "4o", "mini"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 0.15, Some(0.075), None, 0.60),
-    usd_rule("gpt-4o", 139, ModelMatch::Keywords {
-        required: &["gpt", "4o"],
-        forbidden: &["mini"],
-        forbidden_prefixes: &[],
-    }, 2.50, Some(1.25), None, 10.00),
-    usd_rule("o1-pro", 138, ModelMatch::Keywords {
-        required: &["o1", "pro"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 150.00, None, None, 600.00),
-    usd_rule("o1-mini", 137, ModelMatch::Keywords {
-        required: &["o1", "mini"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 1.10, Some(0.55), None, 4.40),
-    usd_rule("o1", 136, ModelMatch::Keywords {
-        required: &["o1"],
-        forbidden: &["mini", "pro"],
-        forbidden_prefixes: &[],
-    }, 15.00, Some(7.50), None, 60.00),
-    usd_rule("o3-pro", 135, ModelMatch::Keywords {
-        required: &["o3", "pro"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 20.00, None, None, 80.00),
-    usd_rule("o3-mini", 134, ModelMatch::Keywords {
-        required: &["o3", "mini"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 1.10, Some(0.55), None, 4.40),
-    usd_rule("o3", 133, ModelMatch::Keywords {
-        required: &["o3"],
-        forbidden: &["mini", "pro", "deep", "research"],
-        forbidden_prefixes: &[],
-    }, 2.00, Some(0.50), None, 8.00),
-    usd_rule("o4-mini", 132, ModelMatch::Keywords {
-        required: &["o4", "mini"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 1.10, Some(0.275), None, 4.40),
-    usd_rule("claude-fable-5", 120, ModelMatch::Keywords {
-        required: &["claude", "fable", "5"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 10.00, Some(1.00), Some(12.50), 50.00),
-    usd_rule("claude-mythos-5", 119, ModelMatch::Keywords {
-        required: &["claude", "mythos", "5"],
-        forbidden: &["preview"],
-        forbidden_prefixes: &[],
-    }, 10.00, Some(1.00), Some(12.50), 50.00),
-    usd_rule("claude-opus-4-8", 118, ModelMatch::Keywords {
-        required: &["claude", "opus", "4.8"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 5.00, Some(0.50), Some(6.25), 25.00),
-    usd_rule("claude-opus-4-7", 117, ModelMatch::Keywords {
-        required: &["claude", "opus", "4.7"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 5.00, Some(0.50), Some(6.25), 25.00),
-    usd_rule("claude-opus-4-6", 116, ModelMatch::Keywords {
-        required: &["claude", "opus", "4.6"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 5.00, Some(0.50), Some(6.25), 25.00),
-    usd_rule("claude-opus-4-5", 115, ModelMatch::Keywords {
-        required: &["claude", "opus", "4.5"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 5.00, Some(0.50), Some(6.25), 25.00),
+    usd_rule(
+        "gpt-5.5-pro",
+        157,
+        ModelMatch::Keywords {
+            required: &["gpt", "5.5", "pro"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        30.00,
+        None,
+        None,
+        180.00,
+    ),
+    usd_rule(
+        "gpt-5.5",
+        156,
+        ModelMatch::Keywords {
+            required: &["gpt", "5.5"],
+            forbidden: &["pro"],
+            forbidden_prefixes: &[],
+        },
+        5.00,
+        Some(0.50),
+        None,
+        30.00,
+    ),
+    usd_rule(
+        "gpt-5.4-pro",
+        155,
+        ModelMatch::Keywords {
+            required: &["gpt", "5.4", "pro"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        30.00,
+        None,
+        None,
+        180.00,
+    ),
+    usd_rule(
+        "gpt-5.4-mini",
+        154,
+        ModelMatch::Keywords {
+            required: &["gpt", "5.4", "mini"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        0.75,
+        Some(0.075),
+        None,
+        4.50,
+    ),
+    usd_rule(
+        "gpt-5.4-nano",
+        153,
+        ModelMatch::Keywords {
+            required: &["gpt", "5.4", "nano"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        0.20,
+        Some(0.02),
+        None,
+        1.25,
+    ),
+    usd_rule(
+        "gpt-5.4",
+        152,
+        ModelMatch::Keywords {
+            required: &["gpt", "5.4"],
+            forbidden: &["mini", "nano", "pro"],
+            forbidden_prefixes: &[],
+        },
+        2.50,
+        Some(0.25),
+        None,
+        15.00,
+    ),
+    usd_rule(
+        "gpt-5.2-pro",
+        151,
+        ModelMatch::Keywords {
+            required: &["gpt", "5.2", "pro"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        21.00,
+        None,
+        None,
+        168.00,
+    ),
+    usd_rule(
+        "gpt-5.2",
+        150,
+        ModelMatch::Keywords {
+            required: &["gpt", "5.2"],
+            forbidden: &["pro"],
+            forbidden_prefixes: &[],
+        },
+        1.75,
+        Some(0.175),
+        None,
+        14.00,
+    ),
+    usd_rule(
+        "gpt-5.1",
+        149,
+        ModelMatch::Keywords {
+            required: &["gpt", "5.1"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        1.25,
+        Some(0.125),
+        None,
+        10.00,
+    ),
+    usd_rule(
+        "gpt-5-pro",
+        148,
+        ModelMatch::Keywords {
+            required: &["gpt", "5", "pro"],
+            forbidden: &[],
+            forbidden_prefixes: &["5."],
+        },
+        15.00,
+        None,
+        None,
+        120.00,
+    ),
+    usd_rule(
+        "gpt-5-mini",
+        147,
+        ModelMatch::Keywords {
+            required: &["gpt", "5", "mini"],
+            forbidden: &[],
+            forbidden_prefixes: &["5."],
+        },
+        0.25,
+        Some(0.025),
+        None,
+        2.00,
+    ),
+    usd_rule(
+        "gpt-5-nano",
+        146,
+        ModelMatch::Keywords {
+            required: &["gpt", "5", "nano"],
+            forbidden: &[],
+            forbidden_prefixes: &["5."],
+        },
+        0.05,
+        Some(0.005),
+        None,
+        0.40,
+    ),
+    usd_rule(
+        "gpt-5",
+        145,
+        ModelMatch::Keywords {
+            required: &["gpt", "5"],
+            forbidden: &["mini", "nano", "pro"],
+            forbidden_prefixes: &["5."],
+        },
+        1.25,
+        Some(0.125),
+        None,
+        10.00,
+    ),
+    usd_rule(
+        "gpt-4.1-mini",
+        144,
+        ModelMatch::Keywords {
+            required: &["gpt", "4.1", "mini"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        0.40,
+        Some(0.10),
+        None,
+        1.60,
+    ),
+    usd_rule(
+        "gpt-4.1-nano",
+        143,
+        ModelMatch::Keywords {
+            required: &["gpt", "4.1", "nano"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        0.10,
+        Some(0.025),
+        None,
+        0.40,
+    ),
+    usd_rule(
+        "gpt-4.1",
+        142,
+        ModelMatch::Keywords {
+            required: &["gpt", "4.1"],
+            forbidden: &["mini", "nano"],
+            forbidden_prefixes: &[],
+        },
+        2.00,
+        Some(0.50),
+        None,
+        8.00,
+    ),
+    usd_rule(
+        "gpt-4o-2024-05-13",
+        141,
+        ModelMatch::Keywords {
+            required: &["gpt", "4o", "2024", "05", "13"],
+            forbidden: &["mini"],
+            forbidden_prefixes: &[],
+        },
+        5.00,
+        None,
+        None,
+        15.00,
+    ),
+    usd_rule(
+        "gpt-4o-mini",
+        140,
+        ModelMatch::Keywords {
+            required: &["gpt", "4o", "mini"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        0.15,
+        Some(0.075),
+        None,
+        0.60,
+    ),
+    usd_rule(
+        "gpt-4o",
+        139,
+        ModelMatch::Keywords {
+            required: &["gpt", "4o"],
+            forbidden: &["mini"],
+            forbidden_prefixes: &[],
+        },
+        2.50,
+        Some(1.25),
+        None,
+        10.00,
+    ),
+    usd_rule(
+        "o1-pro",
+        138,
+        ModelMatch::Keywords {
+            required: &["o1", "pro"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        150.00,
+        None,
+        None,
+        600.00,
+    ),
+    usd_rule(
+        "o1-mini",
+        137,
+        ModelMatch::Keywords {
+            required: &["o1", "mini"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        1.10,
+        Some(0.55),
+        None,
+        4.40,
+    ),
+    usd_rule(
+        "o1",
+        136,
+        ModelMatch::Keywords {
+            required: &["o1"],
+            forbidden: &["mini", "pro"],
+            forbidden_prefixes: &[],
+        },
+        15.00,
+        Some(7.50),
+        None,
+        60.00,
+    ),
+    usd_rule(
+        "o3-pro",
+        135,
+        ModelMatch::Keywords {
+            required: &["o3", "pro"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        20.00,
+        None,
+        None,
+        80.00,
+    ),
+    usd_rule(
+        "o3-mini",
+        134,
+        ModelMatch::Keywords {
+            required: &["o3", "mini"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        1.10,
+        Some(0.55),
+        None,
+        4.40,
+    ),
+    usd_rule(
+        "o3",
+        133,
+        ModelMatch::Keywords {
+            required: &["o3"],
+            forbidden: &["mini", "pro", "deep", "research"],
+            forbidden_prefixes: &[],
+        },
+        2.00,
+        Some(0.50),
+        None,
+        8.00,
+    ),
+    usd_rule(
+        "o4-mini",
+        132,
+        ModelMatch::Keywords {
+            required: &["o4", "mini"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        1.10,
+        Some(0.275),
+        None,
+        4.40,
+    ),
+    usd_rule(
+        "claude-fable-5",
+        120,
+        ModelMatch::Keywords {
+            required: &["claude", "fable", "5"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        10.00,
+        Some(1.00),
+        Some(12.50),
+        50.00,
+    ),
+    usd_rule(
+        "claude-mythos-5",
+        119,
+        ModelMatch::Keywords {
+            required: &["claude", "mythos", "5"],
+            forbidden: &["preview"],
+            forbidden_prefixes: &[],
+        },
+        10.00,
+        Some(1.00),
+        Some(12.50),
+        50.00,
+    ),
+    usd_rule(
+        "claude-opus-4-8",
+        118,
+        ModelMatch::Keywords {
+            required: &["claude", "opus", "4.8"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        5.00,
+        Some(0.50),
+        Some(6.25),
+        25.00,
+    ),
+    usd_rule(
+        "claude-opus-4-7",
+        117,
+        ModelMatch::Keywords {
+            required: &["claude", "opus", "4.7"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        5.00,
+        Some(0.50),
+        Some(6.25),
+        25.00,
+    ),
+    usd_rule(
+        "claude-opus-4-6",
+        116,
+        ModelMatch::Keywords {
+            required: &["claude", "opus", "4.6"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        5.00,
+        Some(0.50),
+        Some(6.25),
+        25.00,
+    ),
+    usd_rule(
+        "claude-opus-4-5",
+        115,
+        ModelMatch::Keywords {
+            required: &["claude", "opus", "4.5"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        5.00,
+        Some(0.50),
+        Some(6.25),
+        25.00,
+    ),
     // Introductory pricing is valid through 2026-08-31; revisit before 2026-09-01.
-    usd_rule("claude-sonnet-5", 114, ModelMatch::Keywords {
-        required: &["claude", "sonnet", "5"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 2.00, Some(0.20), Some(2.50), 10.00),
-    usd_rule("claude-sonnet-4-6", 113, ModelMatch::Keywords {
-        required: &["claude", "sonnet", "4.6"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 3.00, Some(0.30), Some(3.75), 15.00),
-    usd_rule("claude-sonnet-4-5", 112, ModelMatch::Keywords {
-        required: &["claude", "sonnet", "4.5"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 3.00, Some(0.30), Some(3.75), 15.00),
-    usd_rule("claude-sonnet", 111, ModelMatch::Keywords {
-        required: &["claude", "sonnet"],
-        forbidden: &["5", "4.6", "4.5"],
-        forbidden_prefixes: &[],
-    }, 3.00, Some(0.30), Some(3.75), 15.00),
-    usd_rule("claude-haiku-4-5", 110, ModelMatch::Keywords {
-        required: &["claude", "haiku", "4.5"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 1.00, Some(0.10), Some(1.25), 5.00),
-    usd_rule("claude-haiku-3-5", 109, ModelMatch::Keywords {
-        required: &["claude", "haiku", "3.5"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 0.80, Some(0.08), Some(1.00), 4.00),
-    usd_rule("kimi-k2.6", 90, ModelMatch::Keywords {
-        required: &["kimi", "2.6"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 0.95, Some(0.16), Some(0.95), 4.00),
-    usd_rule("kimi-k2.5", 89, ModelMatch::Keywords {
-        required: &["kimi", "2.5"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 0.60, Some(0.10), Some(0.60), 3.00),
-    usd_rule("gemini-2.5-flash", 88, ModelMatch::Keywords {
-        required: &["gemini", "2.5", "flash"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 0.30, Some(0.075), Some(0.30), 2.50),
-    usd_rule("gemini-2.5-pro", 87, ModelMatch::Keywords {
-        required: &["gemini", "2.5", "pro"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 1.25, Some(0.3125), Some(1.25), 10.00),
-    usd_rule("deepseek-v4-flash", 86, ModelMatch::Keywords {
-        required: &["deepseek", "v4", "flash"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 0.14, Some(0.0028), Some(0.14), 0.28),
-    usd_rule("deepseek-v4-pro", 85, ModelMatch::Keywords {
-        required: &["deepseek", "v4", "pro"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 0.435, Some(0.0036), Some(0.435), 0.87),
-    cny_rule("qwen3-max", 84, ModelMatch::Keywords {
-        required: &["qwen3", "max"],
-        forbidden: &[],
-        forbidden_prefixes: &["qwen3.", "3."],
-    }, 3.00, Some(3.00), Some(3.00), 12.00),
-    cny_rule("qwen-max", 83, ModelMatch::Keywords {
-        required: &["qwen", "max"],
-        forbidden: &["qwen3"],
-        forbidden_prefixes: &[],
-    }, 2.40, Some(2.40), Some(2.40), 9.60),
-    cny_rule("doubao-seed-1.6", 82, ModelMatch::Keywords {
-        required: &["doubao", "seed", "1.6"],
-        forbidden: &[],
-        forbidden_prefixes: &[],
-    }, 0.40, Some(0.16), Some(0.40), 4.00),
+    usd_rule(
+        "claude-sonnet-5",
+        114,
+        ModelMatch::Keywords {
+            required: &["claude", "sonnet", "5"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        2.00,
+        Some(0.20),
+        Some(2.50),
+        10.00,
+    ),
+    usd_rule(
+        "claude-sonnet-4-6",
+        113,
+        ModelMatch::Keywords {
+            required: &["claude", "sonnet", "4.6"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        3.00,
+        Some(0.30),
+        Some(3.75),
+        15.00,
+    ),
+    usd_rule(
+        "claude-sonnet-4-5",
+        112,
+        ModelMatch::Keywords {
+            required: &["claude", "sonnet", "4.5"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        3.00,
+        Some(0.30),
+        Some(3.75),
+        15.00,
+    ),
+    usd_rule(
+        "claude-sonnet",
+        111,
+        ModelMatch::Keywords {
+            required: &["claude", "sonnet"],
+            forbidden: &["5", "4.6", "4.5"],
+            forbidden_prefixes: &[],
+        },
+        3.00,
+        Some(0.30),
+        Some(3.75),
+        15.00,
+    ),
+    usd_rule(
+        "claude-haiku-4-5",
+        110,
+        ModelMatch::Keywords {
+            required: &["claude", "haiku", "4.5"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        1.00,
+        Some(0.10),
+        Some(1.25),
+        5.00,
+    ),
+    usd_rule(
+        "claude-haiku-3-5",
+        109,
+        ModelMatch::Keywords {
+            required: &["claude", "haiku", "3.5"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        0.80,
+        Some(0.08),
+        Some(1.00),
+        4.00,
+    ),
+    usd_rule(
+        "kimi-k2.6",
+        90,
+        ModelMatch::Keywords {
+            required: &["kimi", "2.6"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        0.95,
+        Some(0.16),
+        Some(0.95),
+        4.00,
+    ),
+    usd_rule(
+        "kimi-k2.5",
+        89,
+        ModelMatch::Keywords {
+            required: &["kimi", "2.5"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        0.60,
+        Some(0.10),
+        Some(0.60),
+        3.00,
+    ),
+    usd_rule(
+        "gemini-2.5-flash",
+        88,
+        ModelMatch::Keywords {
+            required: &["gemini", "2.5", "flash"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        0.30,
+        Some(0.075),
+        Some(0.30),
+        2.50,
+    ),
+    usd_rule(
+        "gemini-2.5-pro",
+        87,
+        ModelMatch::Keywords {
+            required: &["gemini", "2.5", "pro"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        1.25,
+        Some(0.3125),
+        Some(1.25),
+        10.00,
+    ),
+    usd_rule(
+        "deepseek-v4-flash",
+        86,
+        ModelMatch::Keywords {
+            required: &["deepseek", "v4", "flash"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        0.14,
+        Some(0.0028),
+        Some(0.14),
+        0.28,
+    ),
+    usd_rule(
+        "deepseek-v4-pro",
+        85,
+        ModelMatch::Keywords {
+            required: &["deepseek", "v4", "pro"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        0.435,
+        Some(0.0036),
+        Some(0.435),
+        0.87,
+    ),
+    cny_rule(
+        "qwen3-max",
+        84,
+        ModelMatch::Keywords {
+            required: &["qwen3", "max"],
+            forbidden: &[],
+            forbidden_prefixes: &["qwen3.", "3."],
+        },
+        3.00,
+        Some(3.00),
+        Some(3.00),
+        12.00,
+    ),
+    cny_rule(
+        "qwen-max",
+        83,
+        ModelMatch::Keywords {
+            required: &["qwen", "max"],
+            forbidden: &["qwen3"],
+            forbidden_prefixes: &[],
+        },
+        2.40,
+        Some(2.40),
+        Some(2.40),
+        9.60,
+    ),
+    cny_rule(
+        "doubao-seed-1.6",
+        82,
+        ModelMatch::Keywords {
+            required: &["doubao", "seed", "1.6"],
+            forbidden: &[],
+            forbidden_prefixes: &[],
+        },
+        0.40,
+        Some(0.16),
+        Some(0.40),
+        4.00,
+    ),
 ];
 
 const FALLBACK_PRICING_RULE: PricingRule = PricingRule {
@@ -517,11 +911,7 @@ fn has_token_with_prefix(tokens: &[String], prefix: &str) -> bool {
     tokens.iter().any(|token| token.starts_with(prefix))
 }
 
-fn has_prefixed_major_version_at_least(
-    tokens: &[String],
-    prefix: &str,
-    minimum: u16,
-) -> bool {
+fn has_prefixed_major_version_at_least(tokens: &[String], prefix: &str, minimum: u16) -> bool {
     tokens
         .iter()
         .filter_map(|token| token.strip_prefix(prefix))
@@ -530,10 +920,7 @@ fn has_prefixed_major_version_at_least(
 }
 
 fn parse_major_version_token(token: &str) -> Option<u16> {
-    if token.is_empty()
-        || token.len() > 3
-        || !token.chars().all(|ch| ch.is_ascii_digit())
-    {
+    if token.is_empty() || token.len() > 3 || !token.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
     }
     token.parse().ok()
@@ -582,10 +969,7 @@ fn match_score(rule: PricingRule, model: &str, tokens: &[String]) -> Option<Matc
                 .any(|prefix| has_token_with_prefix(tokens, prefix));
             let future_version_matches = hits_future_version_guard(rule.id, tokens);
 
-            if required_matches
-                && !forbidden_matches
-                && !prefix_matches
-                && !future_version_matches
+            if required_matches && !forbidden_matches && !prefix_matches && !future_version_matches
             {
                 Some(MatchScore {
                     kind: 2,
@@ -696,6 +1080,61 @@ pub fn estimate_model_cost_breakdown(usage: &ModelTokenUsage) -> PricedModelCost
             + drivers.reasoning_output_cost
             + drivers.cache_creation_input_cost
             + drivers.cached_input_cost,
+        total_tokens: usage.total_tokens.max(0),
+        pricing_status,
+        drivers,
+    }
+}
+
+/// 聚合桶定价入口。与逐行 raw 定价等价的前提：
+/// - 只解析一次 pricing rule / fallback；
+/// - 直接使用预聚合的 `billable_uncached_input_tokens`，不再从分量 clamp；
+/// - `unattributed_total_tokens` 按平均价计入 `unattributed_cost`；
+/// - `total_tokens` 仅作展示总量，不反推分量。
+pub fn estimate_aggregated_model_cost_breakdown(
+    usage: &AggregatedModelTokenUsage,
+) -> PricedModelCostBreakdown {
+    let (rule, pricing_status) = match find_rule(usage.model.as_deref()) {
+        Some(rule) => (rule, PricingStatus::Rule),
+        None => (FALLBACK_PRICING_RULE, PricingStatus::Fallback),
+    };
+
+    let input = rate_to_cny(rule, rule.input_per_1m);
+    let output = rate_to_cny(rule, rule.output_per_1m);
+    let cached_input = rate_to_cny(rule, rule.cached_input_per_1m.unwrap_or(rule.input_per_1m));
+    let cache_creation = rate_to_cny(
+        rule,
+        rule.cache_creation_input_per_1m
+            .unwrap_or(rule.input_per_1m),
+    );
+    let reasoning_output = rate_to_cny(
+        rule,
+        rule.reasoning_output_per_1m.unwrap_or(rule.output_per_1m),
+    );
+
+    let drivers = PricedCostDrivers {
+        // 用预聚合的 billable 值直接定价，不再 clamp——逐行 clamp 已在聚合阶段完成。
+        input_cost: price_tokens(usage.billable_uncached_input_tokens, input),
+        output_cost: price_tokens(usage.output_tokens, output),
+        reasoning_output_cost: price_tokens(usage.reasoning_output_tokens, reasoning_output),
+        cache_creation_input_cost: price_tokens(usage.cache_creation_input_tokens, cache_creation),
+        cached_input_cost: price_tokens(usage.cached_input_tokens, cached_input),
+        // 只有原始 total-only 观测才进 unattributed，按平均价计价。
+        unattributed_cost: price_tokens(
+            usage.unattributed_total_tokens,
+            DEFAULT_AVERAGE_CNY_PER_1M_TOKENS,
+        ),
+        cached_input_tokens: usage.cached_input_tokens.max(0),
+        input_tokens: usage.input_tokens.max(0),
+    };
+
+    PricedModelCostBreakdown {
+        estimated_cost: drivers.input_cost
+            + drivers.output_cost
+            + drivers.reasoning_output_cost
+            + drivers.cache_creation_input_cost
+            + drivers.cached_input_cost
+            + drivers.unattributed_cost,
         total_tokens: usage.total_tokens.max(0),
         pricing_status,
         drivers,
@@ -1024,8 +1463,14 @@ mod tests {
 
     #[test]
     fn gpt_4_and_o_series_rules_use_official_standard_prices() {
-        assert_rule_cost("gpt-4o-mini", expected_usage_cost_usd(0.15, Some(0.075), None, 0.6));
-        assert_rule_cost("o4-mini", expected_usage_cost_usd(1.1, Some(0.275), None, 4.4));
+        assert_rule_cost(
+            "gpt-4o-mini",
+            expected_usage_cost_usd(0.15, Some(0.075), None, 0.6),
+        );
+        assert_rule_cost(
+            "o4-mini",
+            expected_usage_cost_usd(1.1, Some(0.275), None, 4.4),
+        );
     }
 
     #[test]
@@ -1068,10 +1513,22 @@ mod tests {
 
     #[test]
     fn claude_rules_use_official_prices_with_sonnet_5_introductory_until_2026_08_31() {
-        assert_rule_cost("claude-fable-5", expected_usage_cost_usd(10.0, Some(1.0), Some(12.5), 50.0));
-        assert_rule_cost("claude-opus-4-8", expected_usage_cost_usd(5.0, Some(0.5), Some(6.25), 25.0));
-        assert_rule_cost("claude-sonnet-5", expected_usage_cost_usd(2.0, Some(0.2), Some(2.5), 10.0));
-        assert_rule_cost("claude-haiku-4-5", expected_usage_cost_usd(1.0, Some(0.1), Some(1.25), 5.0));
+        assert_rule_cost(
+            "claude-fable-5",
+            expected_usage_cost_usd(10.0, Some(1.0), Some(12.5), 50.0),
+        );
+        assert_rule_cost(
+            "claude-opus-4-8",
+            expected_usage_cost_usd(5.0, Some(0.5), Some(6.25), 25.0),
+        );
+        assert_rule_cost(
+            "claude-sonnet-5",
+            expected_usage_cost_usd(2.0, Some(0.2), Some(2.5), 10.0),
+        );
+        assert_rule_cost(
+            "claude-haiku-4-5",
+            expected_usage_cost_usd(1.0, Some(0.1), Some(1.25), 5.0),
+        );
     }
 
     #[test]
@@ -1126,6 +1583,82 @@ mod tests {
 
         assert_eq!(cost.pricing_status, PricingStatus::Fallback);
         assert_close(cost.estimated_cost, DEFAULT_AVERAGE_CNY_PER_1M_TOKENS);
+    }
+
+    #[test]
+    fn aggregated_pricing_matches_per_row_raw_for_mixed_bucket() {
+        // 一条 component + 一条 total-only 落同 model：聚合定价必须逐分量、
+        // unattributed 与总额都等于两条 raw 分别定价再求和。
+        let component = ModelTokenUsage {
+            model: Some("gpt-5.5".to_string()),
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            cached_input_tokens: 250_000,
+            cache_creation_input_tokens: 100_000,
+            reasoning_output_tokens: 50_000,
+            total_tokens: 1_900_000,
+        };
+        let total_only = ModelTokenUsage {
+            model: Some("gpt-5.5".to_string()),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 1_000_000,
+        };
+        let raw_component = estimate_model_cost_breakdown(&component);
+        let raw_total_only = estimate_model_cost_breakdown(&total_only);
+
+        // 聚合：billable 逐行 clamp 后求和；unattributed 只来自 total-only 行。
+        let aggregated = estimate_aggregated_model_cost_breakdown(&AggregatedModelTokenUsage {
+            model: Some("gpt-5.5".to_string()),
+            input_tokens: 1_000_000,
+            billable_uncached_input_tokens: (1_000_000i64 - 250_000 - 100_000).max(0),
+            output_tokens: 500_000,
+            cached_input_tokens: 250_000,
+            cache_creation_input_tokens: 100_000,
+            reasoning_output_tokens: 50_000,
+            unattributed_total_tokens: 1_000_000,
+            total_tokens: 2_900_000,
+        });
+
+        assert_eq!(aggregated.pricing_status, PricingStatus::Rule);
+        assert_close(
+            aggregated.drivers.input_cost,
+            raw_component.drivers.input_cost + raw_total_only.drivers.input_cost,
+        );
+        assert_close(
+            aggregated.drivers.unattributed_cost,
+            raw_component.drivers.unattributed_cost + raw_total_only.drivers.unattributed_cost,
+        );
+        assert_close(
+            aggregated.estimated_cost,
+            raw_component.estimated_cost + raw_total_only.estimated_cost,
+        );
+        assert_eq!(aggregated.total_tokens, 2_900_000);
+    }
+
+    #[test]
+    fn aggregated_pricing_uses_fallback_for_unknown_model() {
+        let aggregated = estimate_aggregated_model_cost_breakdown(&AggregatedModelTokenUsage {
+            model: Some("unknown-internal-model".to_string()),
+            input_tokens: 0,
+            billable_uncached_input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            unattributed_total_tokens: 1_000_000,
+            total_tokens: 1_000_000,
+        });
+
+        assert_eq!(aggregated.pricing_status, PricingStatus::Fallback);
+        assert_close(
+            aggregated.drivers.unattributed_cost,
+            DEFAULT_AVERAGE_CNY_PER_1M_TOKENS,
+        );
+        assert_close(aggregated.estimated_cost, DEFAULT_AVERAGE_CNY_PER_1M_TOKENS);
     }
 
     #[test]

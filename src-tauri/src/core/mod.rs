@@ -4,5 +4,6 @@ pub mod dedupe;
 pub mod observation;
 pub mod pricing;
 pub mod profile;
+pub mod profile_rollup;
 pub mod usage_series;
 pub mod usage_store;
