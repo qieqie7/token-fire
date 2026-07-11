@@ -6,6 +6,7 @@ pub mod ingest_scheduler;
 pub mod logging;
 pub mod menu;
 pub mod paths;
+pub mod profile_query;
 pub mod release_check;
 pub mod runtime;
 pub mod socket_server;

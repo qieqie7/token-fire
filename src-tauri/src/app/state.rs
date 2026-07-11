@@ -16,7 +16,7 @@ use crate::app::debug_bundle::{
     create_debug_bundle_with_source_statuses_and_runtime_health, RuntimeHealth,
 };
 use crate::app::floating_widget::WidgetState;
-use crate::app::logging::{write_jsonl_event, DebugLogGate};
+use crate::app::logging::{write_jsonl_event, DebugLogGate, RuntimeLogSinks};
 use crate::app::paths::RuntimePaths;
 use crate::app::runtime::token_fire_hook_path_from_exe;
 use crate::app::status::{ui_status_from_sources, UiStatus};
@@ -444,6 +444,18 @@ impl AppState {
     ) -> anyhow::Result<ProfileSummary> {
         let store = UsageStore::open(&self.paths.database)?;
         store.profile_summary_at(period, now_utc, now_local)
+    }
+
+    /// owned database path，供 async profile command 交给 spawn_blocking，
+    /// 避免把借用的 `State<'_, AppState>` 跨越异步边界。
+    pub fn profile_database_path(&self) -> PathBuf {
+        self.paths.database.clone()
+    }
+
+    /// clone 出诊断日志 sink（owned），供 async profile command 在 await 返回后记录，
+    /// 不进入 spawn_blocking closure。
+    pub fn profile_log_sinks(&self) -> RuntimeLogSinks {
+        RuntimeLogSinks::new(self.paths.clone(), self.debug_log_gate.clone())
     }
 
     pub fn handle_menu_action(&self, action: MenuAction) -> anyhow::Result<MenuActionOutcome> {
