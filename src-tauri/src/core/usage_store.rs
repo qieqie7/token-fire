@@ -105,6 +105,22 @@ pub struct ProfileRollupRebuildOutcome {
     pub schema_version: String,
 }
 
+/// 一次 Profile 查询实际走的路径：Rollup（完整桶 + 首尾 raw 部分桶）或 RawFallback（整体回退）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileQuerySource {
+    Rollup,
+    RawFallback,
+}
+
+/// Profile 查询结果 + 诊断信息（供 App 层记录 profile_query_source / rollup_row_count 等）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileQueryOutcome {
+    pub summary: ProfileSummary,
+    pub source: ProfileQuerySource,
+    pub rollup_row_count: usize,
+    pub rollup_schema_version: Option<String>,
+}
+
 pub struct UsageStore {
     conn: Connection,
 }
@@ -1127,10 +1143,15 @@ impl UsageStore {
         drivers
     }
 
-    fn year_profile_from_rows(
+    fn year_profile_from_rows<Tz>(
         rows: &[PricedProfileObservationRow],
-        now_local: DateTime<Local>,
-    ) -> YearProfileSummary {
+        now_local: DateTime<Tz>,
+    ) -> YearProfileSummary
+    where
+        Tz: chrono::TimeZone + Copy,
+    {
+        // 热力图按 now_local 时区归属本地日期（不使用系统 Local），与 raw/rollup 路径一致。
+        let tz = now_local.timezone();
         let today = now_local.date_naive();
         let first_day = today - chrono::Days::new(364);
         let mut days = (0..365)
@@ -1141,7 +1162,7 @@ impl UsageStore {
             .collect::<BTreeMap<_, _>>();
 
         for row in rows {
-            let local_date = row.observed_at.with_timezone(&Local).date_naive();
+            let local_date = row.observed_at.with_timezone(&tz).date_naive();
             if let Some((estimated_cost, total_tokens)) = days.get_mut(&local_date) {
                 *estimated_cost += row.estimated_cost;
                 *total_tokens += row.total_tokens;
@@ -1202,12 +1223,16 @@ impl UsageStore {
         }
     }
 
-    fn period_usage_trend(
+    fn period_usage_trend<Tz>(
         period: ProfilePeriod,
         rows: &[PricedProfileObservationRow],
         now_utc: DateTime<Utc>,
-        now_local: DateTime<Local>,
-    ) -> anyhow::Result<crate::core::profile::PeriodUsageTrend> {
+        now_local: DateTime<Tz>,
+    ) -> anyhow::Result<crate::core::profile::PeriodUsageTrend>
+    where
+        Tz: chrono::TimeZone + Copy,
+        Tz::Offset: std::fmt::Display,
+    {
         let mut trend = empty_period_usage_trend(period, now_utc, now_local)?;
         for row in rows {
             if let Some(bucket) = trend.buckets.iter_mut().find(|bucket| {
@@ -1221,29 +1246,30 @@ impl UsageStore {
         Ok(trend)
     }
 
-    pub fn profile_summary_at(
+    /// 用已定价的 year/period 行构造完整 ProfileSummary。raw 与 rollup 两条路径共用此函数，
+    /// 保证 ranked_breakdown / cost_drivers 的 share f64 除法顺序完全一致（parity 精确相等）。
+    fn build_summary_from_priced_rows<Tz>(
         &self,
         period: ProfilePeriod,
         now_utc: DateTime<Utc>,
-        now_local: DateTime<Local>,
-    ) -> anyhow::Result<ProfileSummary> {
-        let first_year_day = now_local.date_naive() - chrono::Days::new(364);
-        let year_start = first_year_day
-            .and_hms_opt(0, 0, 0)
-            .and_then(|start| start.and_local_timezone(Local).single())
-            .ok_or_else(|| anyhow::anyhow!("invalid local year profile start: {first_year_day}"))?;
-        let year_rows =
-            Self::priced_rows(&self.profile_rows_between(year_start.with_timezone(&Utc), now_utc)?);
-        let (period_start, period_end) = period_bounds(period, now_utc, now_local)?;
-        let period_rows = Self::priced_rows(&self.profile_rows_between(period_start, period_end)?);
+        now_local: DateTime<Tz>,
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+        year_rows: &[PricedProfileObservationRow],
+        period_rows: &[PricedProfileObservationRow],
+    ) -> anyhow::Result<ProfileSummary>
+    where
+        Tz: chrono::TimeZone + Copy,
+        Tz::Offset: std::fmt::Display,
+    {
         let period_estimated_cost: f64 = period_rows.iter().map(|row| row.estimated_cost).sum();
         let period_total_tokens: i64 = period_rows.iter().map(|row| row.total_tokens).sum();
-        let trend = Self::period_usage_trend(period, &period_rows, now_utc, now_local)?;
+        let trend = Self::period_usage_trend(period, period_rows, now_utc, now_local.clone())?;
 
         Ok(ProfileSummary {
             generated_at: now_utc,
             currency: "CNY".to_string(),
-            year_profile: Self::year_profile_from_rows(&year_rows, now_local),
+            year_profile: Self::year_profile_from_rows(year_rows, now_local),
             selected_period: PeriodProfileSummary {
                 period,
                 started_at: period_start,
@@ -1251,7 +1277,7 @@ impl UsageStore {
                 estimated_cost: period_estimated_cost,
                 total_tokens: period_total_tokens,
                 trend,
-                model_breakdown: Self::ranked_breakdown(&period_rows, |row| {
+                model_breakdown: Self::ranked_breakdown(period_rows, |row| {
                     let label = model_label(row.model.as_deref());
                     let key = if label == "Unknown" {
                         "unknown".to_string()
@@ -1260,7 +1286,7 @@ impl UsageStore {
                     };
                     (key, label)
                 }),
-                source_breakdown: Self::ranked_breakdown(&period_rows, |row| {
+                source_breakdown: Self::ranked_breakdown(period_rows, |row| {
                     let label = source_label(&row.source);
                     let key = if label == "Unknown" {
                         "unknown".to_string()
@@ -1269,9 +1295,399 @@ impl UsageStore {
                     };
                     (key, label)
                 }),
-                cost_drivers: Self::cost_drivers(&period_rows),
+                cost_drivers: Self::cost_drivers(period_rows),
             },
         })
+    }
+
+    /// 计算 year heatmap 范围起点（now_local 时区的过去第 365 个本地日午夜）。
+    fn year_profile_start<Tz>(now_local: DateTime<Tz>) -> anyhow::Result<DateTime<Utc>>
+    where
+        Tz: chrono::TimeZone + Copy,
+    {
+        let tz = now_local.timezone();
+        let first_year_day = now_local.date_naive() - chrono::Days::new(364);
+        let year_start = first_year_day
+            .and_hms_opt(0, 0, 0)
+            .and_then(|start| tz.from_local_datetime(&start).single())
+            .ok_or_else(|| anyhow::anyhow!("invalid local year profile start: {first_year_day}"))?;
+        Ok(year_start.with_timezone(&Utc))
+    }
+
+    /// 显式 raw 参考路径：整段范围都扫 token_observations 逐行定价。作为 rollup fallback，
+    /// 也是 parity 测试的 ground truth。时区泛型，生产入口传 chrono::Local。
+    pub fn profile_summary_raw_at_in_timezone<Tz>(
+        &self,
+        period: ProfilePeriod,
+        now_utc: DateTime<Utc>,
+        now_local: DateTime<Tz>,
+    ) -> anyhow::Result<ProfileSummary>
+    where
+        Tz: chrono::TimeZone + Copy,
+        Tz::Offset: std::fmt::Display,
+    {
+        let year_start = Self::year_profile_start(now_local.clone())?;
+        let year_rows = Self::priced_rows(&self.profile_rows_between(year_start, now_utc)?);
+        let (period_start, period_end) = period_bounds(period, now_utc, now_local.clone())?;
+        let period_rows = Self::priced_rows(&self.profile_rows_between(period_start, period_end)?);
+        self.build_summary_from_priced_rows(
+            period,
+            now_utc,
+            now_local,
+            period_start,
+            period_end,
+            &year_rows,
+            &period_rows,
+        )
+    }
+
+    /// 生产同步入口（保持既有签名/契约）。委托诊断版本并只返回 summary。
+    pub fn profile_summary_at(
+        &self,
+        period: ProfilePeriod,
+        now_utc: DateTime<Utc>,
+        now_local: DateTime<Local>,
+    ) -> anyhow::Result<ProfileSummary> {
+        Ok(self
+            .profile_summary_with_diagnostics_at(period, now_utc, now_local)?
+            .summary)
+    }
+
+    /// 生产诊断入口：绑定 chrono::Local，返回 summary + 查询来源诊断。
+    pub fn profile_summary_with_diagnostics_at(
+        &self,
+        period: ProfilePeriod,
+        now_utc: DateTime<Utc>,
+        now_local: DateTime<Local>,
+    ) -> anyhow::Result<ProfileQueryOutcome> {
+        self.profile_summary_with_diagnostics_at_in_timezone(period, now_utc, now_local)
+    }
+
+    /// 诊断版查询：优先走 rollup（完整桶 + 首尾 raw 部分桶），任何不可用/异常时整体回退
+    /// 完整 raw 路径。时区泛型，供 parity 测试驱动非 Local 时区。
+    ///
+    /// 回退触发条件（任一）：state != ready 或 schema_version != 当前；任一用户可见边界未对齐
+    /// 到 900 秒（rollup 桶可能横跨两个可见桶）；rollup 读取/解析出错。回退时丢弃全部 rollup
+    /// 中间结果，用新的 raw 路径重算，绝不返回部分数据。
+    pub fn profile_summary_with_diagnostics_at_in_timezone<Tz>(
+        &self,
+        period: ProfilePeriod,
+        now_utc: DateTime<Utc>,
+        now_local: DateTime<Tz>,
+    ) -> anyhow::Result<ProfileQueryOutcome>
+    where
+        Tz: chrono::TimeZone + Copy,
+        Tz::Offset: std::fmt::Display,
+    {
+        match self.try_profile_summary_from_rollup(period, now_utc, now_local.clone())? {
+            Some(outcome) => Ok(outcome),
+            None => {
+                // 完整 raw 回退：新的读取路径，丢弃任何 rollup 中间结果。
+                let summary =
+                    self.profile_summary_raw_at_in_timezone(period, now_utc, now_local)?;
+                Ok(ProfileQueryOutcome {
+                    summary,
+                    source: ProfileQuerySource::RawFallback,
+                    rollup_row_count: 0,
+                    rollup_schema_version: None,
+                })
+            }
+        }
+    }
+
+    /// 尝试用 rollup 构造 summary；返回 None 表示应回退 raw（未就绪/边界不对齐/读取失败）。
+    /// 仅在此判定就绪时读 state/schema_version 两行，不重扫 raw 做守恒 checksum。
+    fn try_profile_summary_from_rollup<Tz>(
+        &self,
+        period: ProfilePeriod,
+        now_utc: DateTime<Utc>,
+        now_local: DateTime<Tz>,
+    ) -> anyhow::Result<Option<ProfileQueryOutcome>>
+    where
+        Tz: chrono::TimeZone + Copy,
+        Tz::Offset: std::fmt::Display,
+    {
+        // 1) 廉价就绪门：只读两行 metadata。
+        let (ready, schema_version) = self.profile_rollup_query_ready()?;
+        if !ready {
+            return Ok(None);
+        }
+
+        // 2) 计算范围与所有用户可见边界。
+        let year_start = Self::year_profile_start(now_local.clone())?;
+        let (period_start, period_end) = period_bounds(period, now_utc, now_local.clone())?;
+        let trend = empty_period_usage_trend(period, now_utc, now_local.clone())?;
+
+        // 边界对齐守卫：所有“用户可见的内部日历/趋势边界”必须对齐 900 秒，否则一个 rollup 桶
+        // 可能横跨两个可见桶被错误归类 → 整体回退。范围的外侧结束点 = now（通常不对齐）不在此列：
+        // 它由尾部 raw 部分桶精确处理（同时正确排除 future 观测）。范围起点是本地午夜，天然对齐，
+        // 也作为首个 trend 桶 started_at 一并校验。
+        let mut boundaries: Vec<DateTime<Utc>> = vec![year_start, period_start];
+        for bucket in &trend.buckets {
+            boundaries.push(bucket.started_at);
+            boundaries.push(bucket.ended_at);
+        }
+        let tz = now_local.timezone();
+        let first_heatmap_day = now_local.date_naive() - chrono::Days::new(364);
+        for offset in 0..=365 {
+            let day = first_heatmap_day + chrono::Days::new(offset);
+            let midnight = day
+                .and_hms_opt(0, 0, 0)
+                .and_then(|naive| tz.from_local_datetime(&naive).single());
+            // 热力图午夜若因该时区午夜 DST 而 ambiguous/nonexistent，则回退 raw（保守正确）。
+            let Some(midnight) = midnight else {
+                return Ok(None);
+            };
+            boundaries.push(midnight.with_timezone(&Utc));
+        }
+        if boundaries.iter().any(|instant| {
+            instant
+                .timestamp()
+                .rem_euclid(PROFILE_ROLLUP_BUCKET_SECONDS)
+                != 0
+        }) {
+            return Ok(None);
+        }
+
+        // 3) 分别取 year 与 period 范围的聚合行（完整 rollup 桶 + 首尾 raw 部分桶）。
+        let (year_aggregates, year_rollup_rows) =
+            match self.aggregates_for_range(year_start, now_utc) {
+                Ok(value) => value,
+                Err(_) => return Ok(None),
+            };
+        let (period_aggregates, period_rollup_rows) =
+            match self.aggregates_for_range(period_start, period_end) {
+                Ok(value) => value,
+                Err(_) => return Ok(None),
+            };
+
+        let year_rows = Self::priced_aggregate_rows(&year_aggregates);
+        let period_rows = Self::priced_aggregate_rows(&period_aggregates);
+        let summary = self.build_summary_from_priced_rows(
+            period,
+            now_utc,
+            now_local,
+            period_start,
+            period_end,
+            &year_rows,
+            &period_rows,
+        )?;
+
+        Ok(Some(ProfileQueryOutcome {
+            summary,
+            source: ProfileQuerySource::Rollup,
+            rollup_row_count: year_rollup_rows + period_rollup_rows,
+            rollup_schema_version: schema_version,
+        }))
+    }
+
+    /// 廉价就绪判定：只读 state + schema_version 两行 metadata，不扫 raw。
+    /// 返回 (ready, schema_version)。ready 需 state==ready 且 schema_version==当前版本。
+    fn profile_rollup_query_ready(&self) -> anyhow::Result<(bool, Option<String>)> {
+        let state = self.rollup_metadata_value(ROLLUP_METADATA_STATE_KEY)?;
+        if state.as_deref() != Some(ROLLUP_STATE_READY) {
+            return Ok((false, None));
+        }
+        let schema_version = self.rollup_metadata_value(ROLLUP_METADATA_SCHEMA_VERSION_KEY)?;
+        if schema_version.as_deref() != Some(PROFILE_ROLLUP_SCHEMA_VERSION) {
+            return Ok((false, None));
+        }
+        Ok((true, schema_version))
+    }
+
+    /// 取 `[start, end)` 的聚合行：中间完整 15 分钟桶读 rollup，首尾未被完整覆盖的桶读 raw。
+    /// 返回 (合并后的聚合, 读到的 rollup 行数)。三段区间互斥且拼满 [start,end)，不重复计数。
+    fn aggregates_for_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> anyhow::Result<(
+        Vec<crate::core::profile_rollup::ProfileTokenAggregate>,
+        usize,
+    )> {
+        use crate::core::profile_rollup::ProfileTokenAggregate;
+
+        let start_ts = start.timestamp();
+        let end_ts = end.timestamp();
+        // first_full = ceil(start,900)；last_full_exclusive = floor(end,900)。
+        let first_full =
+            start_ts.div_euclid(PROFILE_ROLLUP_BUCKET_SECONDS) * PROFILE_ROLLUP_BUCKET_SECONDS;
+        let first_full = if first_full < start_ts {
+            first_full + PROFILE_ROLLUP_BUCKET_SECONDS
+        } else {
+            first_full
+        };
+        let last_full_exclusive =
+            end_ts.div_euclid(PROFILE_ROLLUP_BUCKET_SECONDS) * PROFILE_ROLLUP_BUCKET_SECONDS;
+
+        // 用 (bucket_start_utc, source, model_key) 归并所有来源（rollup + 首尾 raw）。
+        let mut merged: BTreeMap<(i64, String, String), ProfileTokenAggregate> = BTreeMap::new();
+        let mut rollup_row_count = 0usize;
+
+        // 中间完整桶：只读 rollup 表。
+        if first_full < last_full_exclusive {
+            let full_end = DateTime::<Utc>::from_timestamp(last_full_exclusive, 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid rollup full-range end timestamp"))?;
+            let full_start = DateTime::<Utc>::from_timestamp(first_full, 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid rollup full-range start timestamp"))?;
+            for aggregate in self.rollup_aggregates_between(full_start, full_end)? {
+                rollup_row_count += 1;
+                let key = (
+                    aggregate.bucket_start_utc,
+                    aggregate.source.clone(),
+                    normalize_model_key(aggregate.model.as_deref()),
+                );
+                merge_aggregate(merged.entry(key).or_default(), &aggregate);
+            }
+        }
+
+        // 首部分桶 [start, min(first_full, end))。
+        let head_end_ts = first_full.min(end_ts);
+        if start_ts < head_end_ts {
+            let head_end = DateTime::<Utc>::from_timestamp(head_end_ts, 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid rollup head-edge end timestamp"))?;
+            self.accumulate_raw_edge(start, head_end, &mut merged)?;
+        }
+
+        // 尾部分桶 [max(last_full_exclusive, start, head_end), end)。
+        // clamp 到 head_end 是自保护：若调用方传入未对齐 start 且落在同一桶内（middle 为空），
+        // head 已覆盖 [start, end)，tail 起点必须 >= head_end 才不与 head 重复计数。
+        // 现有两个调用点的 start 都经对齐守卫保证 900 对齐，此处 clamp 只为防御未来误用。
+        let tail_start_ts = last_full_exclusive.max(start_ts).max(head_end_ts);
+        if tail_start_ts < end_ts {
+            let tail_start = DateTime::<Utc>::from_timestamp(tail_start_ts, 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid rollup tail-edge start timestamp"))?;
+            self.accumulate_raw_edge(tail_start, end, &mut merged)?;
+        }
+
+        Ok((merged.into_values().collect(), rollup_row_count))
+    }
+
+    /// 把 `[start, end)` 内的 raw 观测逐行聚合进 merged（部分桶用；与 rollup 同一 clamp 方言）。
+    fn accumulate_raw_edge(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        merged: &mut BTreeMap<
+            (i64, String, String),
+            crate::core::profile_rollup::ProfileTokenAggregate,
+        >,
+    ) -> anyhow::Result<()> {
+        use crate::core::profile_rollup::{
+            billable_uncached_input_tokens, unattributed_total_tokens, ProfileTokenAggregate,
+        };
+        for row in self.profile_rows_between(start, end)? {
+            let bucket = bucket_start_utc(row.observed_at);
+            let model_key = normalize_model_key(row.model.as_deref());
+            let entry = merged
+                .entry((bucket, row.source.clone(), model_key))
+                .or_default();
+            // 首次填充身份键（bucket/source/model）。
+            entry.bucket_start_utc = bucket;
+            entry.source = row.source.clone();
+            entry.model = row.model.clone();
+            let contribution = ProfileTokenAggregate {
+                bucket_start_utc: bucket,
+                source: row.source.clone(),
+                model: row.model.clone(),
+                input_tokens: row.input_tokens,
+                billable_uncached_input_tokens: billable_uncached_input_tokens(
+                    row.input_tokens,
+                    row.cached_input_tokens,
+                    row.cache_creation_input_tokens,
+                ),
+                output_tokens: row.output_tokens,
+                cached_input_tokens: row.cached_input_tokens,
+                cache_creation_input_tokens: row.cache_creation_input_tokens,
+                reasoning_output_tokens: row.reasoning_output_tokens,
+                unattributed_total_tokens: unattributed_total_tokens(
+                    row.input_tokens,
+                    row.output_tokens,
+                    row.cached_input_tokens,
+                    row.cache_creation_input_tokens,
+                    row.reasoning_output_tokens,
+                    row.total_tokens,
+                ),
+                total_tokens: row.total_tokens,
+                observation_count: 1,
+            };
+            merge_aggregate(entry, &contribution);
+        }
+        Ok(())
+    }
+
+    /// 读 `[start, end)` 内的完整 rollup 桶（只读 usage_rollups_15m，不扫 raw）。
+    fn rollup_aggregates_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<crate::core::profile_rollup::ProfileTokenAggregate>> {
+        use crate::core::profile_rollup::ProfileTokenAggregate;
+        let mut stmt = self.conn.prepare(
+            r#"
+            select bucket_start_utc, source, model,
+                   input_tokens, billable_uncached_input_tokens, output_tokens,
+                   cached_input_tokens, cache_creation_input_tokens, reasoning_output_tokens,
+                   unattributed_total_tokens, total_tokens, observation_count
+            from usage_rollups_15m
+            where bucket_start_utc >= ?1 and bucket_start_utc < ?2
+            order by bucket_start_utc asc, source asc, model asc
+            "#,
+        )?;
+        let rows = stmt.query_map(params![start.timestamp(), end.timestamp()], |row| {
+            let model_key: String = row.get(2)?;
+            Ok(ProfileTokenAggregate {
+                bucket_start_utc: row.get(0)?,
+                source: row.get(1)?,
+                model: crate::core::profile_rollup::model_from_key(&model_key),
+                input_tokens: row.get(3)?,
+                billable_uncached_input_tokens: row.get(4)?,
+                output_tokens: row.get(5)?,
+                cached_input_tokens: row.get(6)?,
+                cache_creation_input_tokens: row.get(7)?,
+                reasoning_output_tokens: row.get(8)?,
+                unattributed_total_tokens: row.get(9)?,
+                total_tokens: row.get(10)?,
+                observation_count: row.get(11)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 把聚合行定价成 PricedProfileObservationRow：归属瞬间用桶起点（守卫已保证完整桶落在
+    /// 单一 trend 桶/热力图日内），复用与 raw 相同的下游 breakdown/cost_drivers/年历聚合。
+    fn priced_aggregate_rows(
+        aggregates: &[crate::core::profile_rollup::ProfileTokenAggregate],
+    ) -> Vec<PricedProfileObservationRow> {
+        use crate::core::pricing::{
+            estimate_aggregated_model_cost_breakdown, AggregatedModelTokenUsage,
+        };
+        aggregates
+            .iter()
+            .filter_map(|aggregate| {
+                let observed_at = DateTime::<Utc>::from_timestamp(aggregate.bucket_start_utc, 0)?;
+                let usage = AggregatedModelTokenUsage {
+                    model: aggregate.model.clone(),
+                    input_tokens: aggregate.input_tokens,
+                    billable_uncached_input_tokens: aggregate.billable_uncached_input_tokens,
+                    output_tokens: aggregate.output_tokens,
+                    cached_input_tokens: aggregate.cached_input_tokens,
+                    cache_creation_input_tokens: aggregate.cache_creation_input_tokens,
+                    reasoning_output_tokens: aggregate.reasoning_output_tokens,
+                    unattributed_total_tokens: aggregate.unattributed_total_tokens,
+                    total_tokens: aggregate.total_tokens,
+                };
+                let priced = estimate_aggregated_model_cost_breakdown(&usage);
+                Some(PricedProfileObservationRow {
+                    source: aggregate.source.clone(),
+                    model: aggregate.model.clone(),
+                    estimated_cost: priced.estimated_cost,
+                    total_tokens: priced.total_tokens,
+                    drivers: priced.drivers,
+                    observed_at,
+                })
+            })
+            .collect()
     }
 
     pub fn open_tracking_window(&self, started_at: DateTime<Utc>) -> anyhow::Result<i64> {
@@ -1494,6 +1910,45 @@ fn maintain_rollup_boundary(
         params![cutoff_bucket, boundary_end],
     )?;
     Ok(())
+}
+
+/// 把 `contribution` 累加进 `target`（合并 rollup 桶与 raw 部分桶的同 key 聚合）。
+/// 与 rollup 写入/重建同一数值域：saturating add——查询侧只读，即便极端溢出也退化为饱和
+/// 展示值而非 panic（写入侧仍用 checked add 拒绝溢出，事实源不受影响）。
+fn merge_aggregate(
+    target: &mut crate::core::profile_rollup::ProfileTokenAggregate,
+    contribution: &crate::core::profile_rollup::ProfileTokenAggregate,
+) {
+    target.bucket_start_utc = contribution.bucket_start_utc;
+    target.source = contribution.source.clone();
+    target.model = contribution.model.clone();
+    target.input_tokens = target
+        .input_tokens
+        .saturating_add(contribution.input_tokens);
+    target.billable_uncached_input_tokens = target
+        .billable_uncached_input_tokens
+        .saturating_add(contribution.billable_uncached_input_tokens);
+    target.output_tokens = target
+        .output_tokens
+        .saturating_add(contribution.output_tokens);
+    target.cached_input_tokens = target
+        .cached_input_tokens
+        .saturating_add(contribution.cached_input_tokens);
+    target.cache_creation_input_tokens = target
+        .cache_creation_input_tokens
+        .saturating_add(contribution.cache_creation_input_tokens);
+    target.reasoning_output_tokens = target
+        .reasoning_output_tokens
+        .saturating_add(contribution.reasoning_output_tokens);
+    target.unattributed_total_tokens = target
+        .unattributed_total_tokens
+        .saturating_add(contribution.unattributed_total_tokens);
+    target.total_tokens = target
+        .total_tokens
+        .saturating_add(contribution.total_tokens);
+    target.observation_count = target
+        .observation_count
+        .saturating_add(contribution.observation_count);
 }
 
 /// 写入 raw observation（唯一事实源）。封装原 23 列 insert-or-ignore，列映射保持不变。

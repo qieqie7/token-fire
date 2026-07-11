@@ -9,7 +9,8 @@ use token_fire::core::profile::{ProfilePeriod, ProfileSummary, RankedProfileBrea
 use token_fire::core::profile_rollup::{bucket_start_utc, PROFILE_ROLLUP_SCHEMA_VERSION};
 use token_fire::core::usage_series::{WIDGET_USAGE_BUCKET_MINUTES, WIDGET_USAGE_WINDOW_MINUTES};
 use token_fire::core::usage_store::{
-    InsertOutcome, ProfileRollupStatus, RetentionPolicy, RetentionSkipReason, UsageStore,
+    InsertOutcome, ProfileQuerySource, ProfileRollupStatus, RetentionPolicy, RetentionSkipReason,
+    UsageStore,
 };
 
 fn observation(
@@ -2818,4 +2819,407 @@ fn profile_calendar_tz_kolkata_week_month_year_start_at_local_midnight() {
     assert_eq!(year_local.format("%H:%M:%S").to_string(), "00:00:00");
     let expected_year = Utc.with_ymd_and_hms(2025, 12, 31, 18, 30, 0).unwrap();
     assert_eq!(year_start, expected_year);
+}
+
+// ---- Task 6B: rollup 查询与 raw 完整等价性矩阵 -----------------------------------
+
+/// 插入一条 tracked 观测，可指定 source/model/分量，用于 rollup parity 夹具。
+fn seed_obs(
+    store: &UsageStore,
+    id: &str,
+    source: &str,
+    model: Option<&str>,
+    input: i64,
+    output: i64,
+    cached: i64,
+    cache_creation: i64,
+    reasoning: i64,
+    total: i64,
+    observed_at: chrono::DateTime<Utc>,
+) {
+    let mut row = cost_observation(
+        id,
+        model,
+        input,
+        output,
+        cached,
+        cache_creation,
+        reasoning,
+        total,
+        observed_at,
+    );
+    row.source = source.to_string();
+    insert_tracked(store, &row).unwrap();
+}
+
+/// 铺开覆盖 today / week / month / year / 热力图的混合观测：分量型、total-only(unattributed)、
+/// unknown model、cached clamp、同桶多条(桶内合并)、首尾部分桶、future(应被排除)。
+fn seed_parity_fixture(store: &UsageStore, now_utc: chrono::DateTime<Utc>) {
+    // 尾部部分桶 [floor(now,900), now)：分量型，gpt-5.5 / traex。
+    seed_obs(
+        store,
+        "p-tail",
+        "traex",
+        Some("gpt-5.5"),
+        1_000_000,
+        500_000,
+        250_000,
+        100_000,
+        50_000,
+        1_900_000,
+        now_utc - chrono::Duration::minutes(3),
+    );
+    // 今日完整桶：同桶两条 total-only(unattributed)，None model / codex，验证桶内合并。
+    seed_obs(
+        store,
+        "p-today-a",
+        "codex",
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        2_000_000,
+        now_utc - chrono::Duration::minutes(37),
+    );
+    seed_obs(
+        store,
+        "p-today-b",
+        "codex",
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        3_000_000,
+        now_utc - chrono::Duration::minutes(37) + chrono::Duration::seconds(45),
+    );
+    // 今日：cached/creation clamp 边界(input<cached+creation → billable 0)，claude / claude。
+    seed_obs(
+        store,
+        "p-clamp",
+        "claude",
+        Some("claude-sonnet-5"),
+        10,
+        0,
+        8,
+        7,
+        0,
+        25,
+        now_utc - chrono::Duration::hours(2),
+    );
+    // 昨日(本周/本月/本年)：unknown model / cursor → pricing fallback。
+    seed_obs(
+        store,
+        "p-yesterday",
+        "cursor",
+        Some("totally-unknown-model"),
+        400_000,
+        200_000,
+        0,
+        0,
+        0,
+        600_000,
+        now_utc - chrono::Duration::hours(30),
+    );
+    // 本月早些：分量型 gpt-4o / traex。
+    seed_obs(
+        store,
+        "p-month",
+        "traex",
+        Some("gpt-4o"),
+        800_000,
+        300_000,
+        100_000,
+        0,
+        0,
+        1_100_000,
+        now_utc - chrono::Duration::days(10),
+    );
+    // 本年更早月份：分量型。
+    seed_obs(
+        store,
+        "p-year-1",
+        "codex",
+        Some("gpt-5.5"),
+        500_000,
+        250_000,
+        0,
+        0,
+        20_000,
+        770_000,
+        now_utc - chrono::Duration::days(60),
+    );
+    // 本年更早：total-only。
+    seed_obs(
+        store,
+        "p-year-2",
+        "traex",
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        900_000,
+        now_utc - chrono::Duration::days(200),
+    );
+    // future 观测(now+10min)：raw 与 rollup 都必须排除。
+    seed_obs(
+        store,
+        "p-future",
+        "traex",
+        Some("gpt-5.5"),
+        100_000,
+        0,
+        0,
+        0,
+        0,
+        100_000,
+        now_utc + chrono::Duration::minutes(10),
+    );
+}
+
+/// 对给定 period/时区：先取 raw 参考，rebuild 到 ready，再取 rollup 路径，断言来源为 Rollup
+/// 且完整 ProfileSummary 精确等价。
+fn assert_rollup_matches_raw_for_tz<Tz>(
+    store: &mut UsageStore,
+    period: ProfilePeriod,
+    now_utc: chrono::DateTime<Utc>,
+    now_local: chrono::DateTime<Tz>,
+) where
+    Tz: TimeZone + Copy,
+    Tz::Offset: std::fmt::Display,
+{
+    let raw = store
+        .profile_summary_raw_at_in_timezone(period, now_utc, now_local.clone())
+        .unwrap();
+    let ensure = store.ensure_profile_rollup_ready().unwrap();
+    assert!(ensure.rollup_row_count > 0, "rebuild 应产生 rollup 行");
+    let outcome = store
+        .profile_summary_with_diagnostics_at_in_timezone(period, now_utc, now_local)
+        .unwrap();
+    assert_eq!(
+        outcome.source,
+        ProfileQuerySource::Rollup,
+        "ready 时应走 rollup 路径 (period={period:?})"
+    );
+    assert_profile_summary_close(&outcome.summary, &raw);
+}
+
+fn parity_store() -> (tempfile::TempDir, UsageStore) {
+    let dir = tempdir().unwrap();
+    let store = UsageStore::open(&dir.path().join("token-fire.sqlite")).unwrap();
+    (dir, store)
+}
+
+#[test]
+fn profile_rollup_matches_raw_kolkata_all_periods() {
+    let tz = chrono_tz::Asia::Kolkata;
+    // now 带非对齐的分/秒，制造尾部部分桶。
+    let now_local = tz
+        .with_ymd_and_hms(2026, 7, 8, 14, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let (_dir, mut store) = parity_store();
+    seed_parity_fixture(&store, now_utc);
+    for period in [
+        ProfilePeriod::Today,
+        ProfilePeriod::ThisWeek,
+        ProfilePeriod::ThisMonth,
+        ProfilePeriod::ThisYear,
+    ] {
+        assert_rollup_matches_raw_for_tz(&mut store, period, now_utc, now_local);
+    }
+}
+
+#[test]
+fn profile_rollup_matches_raw_kathmandu_all_periods() {
+    let tz = chrono_tz::Asia::Kathmandu;
+    let now_local = tz.with_ymd_and_hms(2026, 7, 8, 9, 22, 13).single().unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let (_dir, mut store) = parity_store();
+    seed_parity_fixture(&store, now_utc);
+    for period in [
+        ProfilePeriod::Today,
+        ProfilePeriod::ThisWeek,
+        ProfilePeriod::ThisMonth,
+        ProfilePeriod::ThisYear,
+    ] {
+        assert_rollup_matches_raw_for_tz(&mut store, period, now_utc, now_local);
+    }
+}
+
+#[test]
+fn profile_rollup_matches_raw_new_york_spring_forward_day() {
+    let tz = chrono_tz::America::New_York;
+    // 2026-03-08 是美东春季跳时日(02:00→03:00)；now 落在跳时之后。
+    let now_local = tz
+        .with_ymd_and_hms(2026, 3, 8, 14, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let (_dir, mut store) = parity_store();
+    seed_parity_fixture(&store, now_utc);
+    for period in [
+        ProfilePeriod::Today,
+        ProfilePeriod::ThisWeek,
+        ProfilePeriod::ThisMonth,
+        ProfilePeriod::ThisYear,
+    ] {
+        assert_rollup_matches_raw_for_tz(&mut store, period, now_utc, now_local);
+    }
+}
+
+#[test]
+fn profile_rollup_matches_raw_new_york_fall_back_day() {
+    let tz = chrono_tz::America::New_York;
+    // 2026-11-01 是美东秋季回拨日(01:00 出现两次)；now 落在回拨之后。
+    let now_local = tz
+        .with_ymd_and_hms(2026, 11, 1, 14, 7, 33)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let (_dir, mut store) = parity_store();
+    seed_parity_fixture(&store, now_utc);
+    for period in [
+        ProfilePeriod::Today,
+        ProfilePeriod::ThisWeek,
+        ProfilePeriod::ThisMonth,
+        ProfilePeriod::ThisYear,
+    ] {
+        assert_rollup_matches_raw_for_tz(&mut store, period, now_utc, now_local);
+    }
+}
+
+#[test]
+fn profile_rollup_matches_raw_excludes_future_and_merges_partial_edges() {
+    // 显式验证：尾部部分桶 + 完整桶不重复计数，future 被排除，桶内多条合并。
+    let tz = chrono_tz::Asia::Kolkata;
+    let now_local = tz
+        .with_ymd_and_hms(2026, 7, 8, 14, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let (_dir, mut store) = parity_store();
+    seed_parity_fixture(&store, now_utc);
+
+    let raw = store
+        .profile_summary_raw_at_in_timezone(ProfilePeriod::Today, now_utc, now_local)
+        .unwrap();
+    store.ensure_profile_rollup_ready().unwrap();
+    let outcome = store
+        .profile_summary_with_diagnostics_at_in_timezone(ProfilePeriod::Today, now_utc, now_local)
+        .unwrap();
+
+    assert_eq!(outcome.source, ProfileQuerySource::Rollup);
+    // 今日总量 = tail(1.9M) + 两条 total-only(2M+3M) + clamp(25)；future(100k) 排除。
+    assert_eq!(
+        outcome.summary.selected_period.total_tokens,
+        1_900_000 + 2_000_000 + 3_000_000 + 25
+    );
+    assert_eq!(
+        outcome.summary.selected_period.total_tokens,
+        raw.selected_period.total_tokens
+    );
+    assert_profile_summary_close(&outcome.summary, &raw);
+}
+
+#[test]
+fn profile_rollup_falls_back_to_raw_when_state_not_ready() {
+    let tz = chrono_tz::Asia::Kolkata;
+    let now_local = tz
+        .with_ymd_and_hms(2026, 7, 8, 14, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let (_dir, store) = parity_store();
+    seed_parity_fixture(&store, now_utc);
+    // 从未 ensure_ready：state 缺失 → 查询整体回退 raw，但结果与 raw 参考一致。
+    let raw = store
+        .profile_summary_raw_at_in_timezone(ProfilePeriod::ThisWeek, now_utc, now_local)
+        .unwrap();
+    let outcome = store
+        .profile_summary_with_diagnostics_at_in_timezone(
+            ProfilePeriod::ThisWeek,
+            now_utc,
+            now_local,
+        )
+        .unwrap();
+    assert_eq!(outcome.source, ProfileQuerySource::RawFallback);
+    assert_eq!(outcome.rollup_schema_version, None);
+    assert_profile_summary_close(&outcome.summary, &raw);
+}
+
+#[test]
+fn profile_rollup_falls_back_to_raw_on_version_mismatch() {
+    let tz = chrono_tz::Asia::Kolkata;
+    let now_local = tz
+        .with_ymd_and_hms(2026, 7, 8, 14, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    seed_parity_fixture(&store, now_utc);
+    store.ensure_profile_rollup_ready().unwrap();
+    let raw = store
+        .profile_summary_raw_at_in_timezone(ProfilePeriod::ThisMonth, now_utc, now_local)
+        .unwrap();
+    // 篡改 schema_version 为未来版本：查询只读该 metadata 即判定不就绪 → 回退。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "update usage_rollup_metadata set value = '999' where key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+    let store = UsageStore::open(&db_path).unwrap();
+    let outcome = store
+        .profile_summary_with_diagnostics_at_in_timezone(
+            ProfilePeriod::ThisMonth,
+            now_utc,
+            now_local,
+        )
+        .unwrap();
+    assert_eq!(outcome.source, ProfileQuerySource::RawFallback);
+    assert_profile_summary_close(&outcome.summary, &raw);
+}
+
+#[test]
+fn profile_rollup_falls_back_to_raw_when_rollup_query_fails() {
+    let tz = chrono_tz::Asia::Kolkata;
+    let now_local = tz
+        .with_ymd_and_hms(2026, 7, 8, 14, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    seed_parity_fixture(&store, now_utc);
+    store.ensure_profile_rollup_ready().unwrap();
+    let raw = store
+        .profile_summary_raw_at_in_timezone(ProfilePeriod::ThisYear, now_utc, now_local)
+        .unwrap();
+    // state 仍为 ready，但用另一连接 drop rollup 表使 store 的 SELECT 失败（结构性错误）。
+    // 不重新 open store（否则 migration 会重建空表）；就绪门只读 metadata 仍判定 ready，
+    // 随后 rollup 读取报 "no such table" → aggregates_for_range 出错 → 整体回退 raw，不返回部分数据。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute_batch("drop table usage_rollups_15m;")
+        .unwrap();
+    let outcome = store
+        .profile_summary_with_diagnostics_at_in_timezone(
+            ProfilePeriod::ThisYear,
+            now_utc,
+            now_local,
+        )
+        .unwrap();
+    assert_eq!(outcome.source, ProfileQuerySource::RawFallback);
+    assert_profile_summary_close(&outcome.summary, &raw);
 }
