@@ -5,7 +5,7 @@ use rusqlite::{params, Connection};
 use tempfile::tempdir;
 use token_fire::core::observation::{NormalizedObservation, SourceRecordIdConfidence};
 use token_fire::core::pricing::{PricingStatus, DEFAULT_AVERAGE_CNY_PER_1M_TOKENS};
-use token_fire::core::profile::ProfilePeriod;
+use token_fire::core::profile::{ProfilePeriod, ProfileSummary, RankedProfileBreakdown};
 use token_fire::core::usage_series::{WIDGET_USAGE_BUCKET_MINUTES, WIDGET_USAGE_WINDOW_MINUTES};
 use token_fire::core::usage_store::{
     InsertOutcome, RetentionPolicy, RetentionSkipReason, UsageStore,
@@ -129,6 +129,170 @@ fn assert_cost_close(actual: f64, expected: f64) {
     assert!(
         (actual - expected).abs() < 0.000_001,
         "expected {expected}, got {actual}"
+    );
+}
+
+/// 逐条比较两个 ranked breakdown：key/label/total_tokens/share 必须精确相等，
+/// 只有浮点成本走 assert_cost_close 容差。用于证明 rollup 与 raw 排序、分组一致。
+#[allow(dead_code)]
+fn assert_breakdown_close(
+    context: &str,
+    actual: &[RankedProfileBreakdown],
+    expected: &[RankedProfileBreakdown],
+) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{context} breakdown length mismatch"
+    );
+    for (index, (actual_row, expected_row)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(actual_row.key, expected_row.key, "{context}[{index}] key");
+        assert_eq!(
+            actual_row.label, expected_row.label,
+            "{context}[{index}] label"
+        );
+        assert_eq!(
+            actual_row.total_tokens, expected_row.total_tokens,
+            "{context}[{index}] total_tokens"
+        );
+        assert_eq!(
+            actual_row.share, expected_row.share,
+            "{context}[{index}] share"
+        );
+        assert_cost_close(actual_row.estimated_cost, expected_row.estimated_cost);
+    }
+}
+
+/// 完整 ProfileSummary parity 断言：逐项比较 365 个 day bucket、model/source
+/// breakdown、cost drivers、peak day、selected period trend。token/日期/标签/排序/
+/// 桶边界必须精确相等，只有浮点成本用 assert_cost_close 容差。供后续 rollup ==
+/// raw 等价性测试复用，不允许只比较总量。
+#[allow(dead_code)]
+fn assert_profile_summary_close(actual: &ProfileSummary, expected: &ProfileSummary) {
+    assert_eq!(actual.generated_at, expected.generated_at);
+    assert_eq!(actual.currency, expected.currency);
+
+    // year profile: 逐日 heatmap 与聚合指标
+    assert_eq!(
+        actual.year_profile.days.len(),
+        expected.year_profile.days.len(),
+        "year_profile.days length"
+    );
+    for (index, (actual_day, expected_day)) in actual
+        .year_profile
+        .days
+        .iter()
+        .zip(expected.year_profile.days.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            actual_day.local_date, expected_day.local_date,
+            "year day[{index}] local_date"
+        );
+        assert_eq!(
+            actual_day.total_tokens, expected_day.total_tokens,
+            "year day[{index}] total_tokens"
+        );
+        assert_eq!(
+            actual_day.intensity, expected_day.intensity,
+            "year day[{index}] intensity"
+        );
+        assert_cost_close(actual_day.estimated_cost, expected_day.estimated_cost);
+    }
+    assert_eq!(
+        actual.year_profile.total_tokens, expected.year_profile.total_tokens,
+        "year_profile.total_tokens"
+    );
+    assert_eq!(
+        actual.year_profile.active_days, expected.year_profile.active_days,
+        "year_profile.active_days"
+    );
+    assert_cost_close(
+        actual.year_profile.estimated_cost,
+        expected.year_profile.estimated_cost,
+    );
+    assert_cost_close(
+        actual.year_profile.average_active_day_cost,
+        expected.year_profile.average_active_day_cost,
+    );
+    match (
+        &actual.year_profile.peak_day,
+        &expected.year_profile.peak_day,
+    ) {
+        (Some(actual_peak), Some(expected_peak)) => {
+            assert_eq!(
+                actual_peak.local_date, expected_peak.local_date,
+                "peak_day.local_date"
+            );
+            assert_eq!(
+                actual_peak.total_tokens, expected_peak.total_tokens,
+                "peak_day.total_tokens"
+            );
+            assert_cost_close(actual_peak.estimated_cost, expected_peak.estimated_cost);
+        }
+        (None, None) => {}
+        _ => panic!("peak_day presence mismatch"),
+    }
+
+    // selected period: 精确总量/边界/趋势桶，浮点成本走容差
+    let actual_period = &actual.selected_period;
+    let expected_period = &expected.selected_period;
+    assert_eq!(actual_period.period, expected_period.period, "period");
+    assert_eq!(
+        actual_period.started_at, expected_period.started_at,
+        "period.started_at"
+    );
+    assert_eq!(
+        actual_period.ended_at, expected_period.ended_at,
+        "period.ended_at"
+    );
+    assert_eq!(
+        actual_period.total_tokens, expected_period.total_tokens,
+        "period.total_tokens"
+    );
+    assert_cost_close(actual_period.estimated_cost, expected_period.estimated_cost);
+    // trend 只含 token/日期/标签/桶边界（无浮点），可整体精确比较
+    assert_eq!(actual_period.trend, expected_period.trend, "period.trend");
+
+    assert_breakdown_close(
+        "model_breakdown",
+        &actual_period.model_breakdown,
+        &expected_period.model_breakdown,
+    );
+    assert_breakdown_close(
+        "source_breakdown",
+        &actual_period.source_breakdown,
+        &expected_period.source_breakdown,
+    );
+
+    // cost drivers: 成本分量与比率走容差，token 计数精确
+    let actual_drivers = &actual_period.cost_drivers;
+    let expected_drivers = &expected_period.cost_drivers;
+    assert_cost_close(actual_drivers.input_cost, expected_drivers.input_cost);
+    assert_cost_close(actual_drivers.output_cost, expected_drivers.output_cost);
+    assert_cost_close(
+        actual_drivers.reasoning_output_cost,
+        expected_drivers.reasoning_output_cost,
+    );
+    assert_cost_close(
+        actual_drivers.cache_creation_input_cost,
+        expected_drivers.cache_creation_input_cost,
+    );
+    assert_cost_close(
+        actual_drivers.cached_input_cost,
+        expected_drivers.cached_input_cost,
+    );
+    assert_cost_close(
+        actual_drivers.unattributed_cost,
+        expected_drivers.unattributed_cost,
+    );
+    assert_eq!(
+        actual_drivers.cached_input_tokens, expected_drivers.cached_input_tokens,
+        "cost_drivers.cached_input_tokens"
+    );
+    assert_cost_close(
+        actual_drivers.cache_read_ratio,
+        expected_drivers.cache_read_ratio,
     );
 }
 
