@@ -17,6 +17,7 @@ use crate::core::profile::{
     PeriodProfileSummary, ProfileCostDrivers, ProfileDayBucket, ProfilePeakDay, ProfilePeriod,
     ProfileSummary, RankedProfileBreakdown, YearProfileSummary,
 };
+use crate::core::profile_rollup::{bucket_start_utc, normalize_model_key};
 use crate::core::usage_series::{
     average_tokens_per_bucket, bucket_index_for, empty_usage_buckets, WidgetUsageSeries,
     WIDGET_USAGE_ACTIVE_THRESHOLD_MINUTES, WIDGET_USAGE_WINDOW_MINUTES,
@@ -37,6 +38,11 @@ pub struct TrackingWindow {
 
 pub const DEFAULT_RETENTION_DAYS: i64 = 365;
 pub const DEFAULT_RETENTION_MIN_INTERVAL_HOURS: i64 = 24;
+
+/// rollup readiness 状态机的 metadata key 与取值。migration 不预写这些；
+/// 完整 rebuild + 翻转 ready + 写 schema_version 由 Task 5 拥有。
+const ROLLUP_METADATA_STATE_KEY: &str = "state";
+const ROLLUP_STATE_INVALID: &str = "invalid";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
@@ -80,6 +86,16 @@ pub struct UsageStore {
     conn: Connection,
 }
 
+/// 只读诊断快照：暴露每个 connection 显式设置的 SQLite PRAGMA，供并发正确性验证与诊断日志使用。
+/// 不含数据库路径或业务数据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionPragmas {
+    pub journal_mode: String,
+    pub synchronous: i64,
+    pub busy_timeout: i64,
+    pub wal_autocheckpoint: i64,
+}
+
 #[derive(Debug, Clone)]
 struct ProfileObservationRow {
     source: String,
@@ -110,8 +126,53 @@ impl UsageStore {
         }
         let conn = Connection::open(path)?;
         let store = Self { conn };
+        store.apply_connection_policy()?;
         store.migrate()?;
         Ok(store)
+    }
+
+    /// 显式设置每个 connection 的 SQLite 策略（OVERRIDE C / spec "SQLite Connection Policy"）。
+    /// 单 writer 多 reader：WAL 让 Profile reader 与 ingest writer 并发；synchronous=FULL 保持
+    /// 与旧默认相当的 durability，不以耐久性换吞吐；busy_timeout 是并发正确性而非润色。
+    /// journal_mode 是数据库级持久属性，其余为 connection-local，故每次 open 都显式重设。
+    fn apply_connection_policy(&self) -> anyhow::Result<()> {
+        // journal_mode 返回结果集，必须用 query_row 消费；WAL 一经设置持久保存于数据库文件。
+        let mode: String = self
+            .conn
+            .query_row("pragma journal_mode = WAL", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            anyhow::bail!("failed to enable WAL journal mode, got: {mode}");
+        }
+        self.conn.execute_batch(
+            r#"
+            pragma synchronous = FULL;
+            pragma busy_timeout = 5000;
+            pragma wal_autocheckpoint = 1000;
+            "#,
+        )?;
+        Ok(())
+    }
+
+    /// 读取当前 connection 的关键 PRAGMA，用于并发正确性验证与诊断日志。
+    pub fn connection_pragmas(&self) -> anyhow::Result<ConnectionPragmas> {
+        let journal_mode: String = self
+            .conn
+            .query_row("pragma journal_mode", [], |row| row.get(0))?;
+        let synchronous: i64 = self
+            .conn
+            .query_row("pragma synchronous", [], |row| row.get(0))?;
+        let busy_timeout: i64 = self
+            .conn
+            .query_row("pragma busy_timeout", [], |row| row.get(0))?;
+        let wal_autocheckpoint: i64 =
+            self.conn
+                .query_row("pragma wal_autocheckpoint", [], |row| row.get(0))?;
+        Ok(ConnectionPragmas {
+            journal_mode,
+            synchronous,
+            busy_timeout,
+            wal_autocheckpoint,
+        })
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
@@ -163,6 +224,29 @@ impl UsageStore {
               updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );
             create table if not exists retention_state (
+              key text primary key,
+              value text not null
+            );
+            -- 派生读模型：15 分钟 UTC 桶聚合。token/count 字段 CHECK 非负且必须是 integer，
+            -- 避免 SUM 溢出被 SQLite 静默提升为 REAL 后写回。model=NULL 在 key 中规范化为 ''。
+            create table if not exists usage_rollups_15m (
+              bucket_start_utc integer not null,
+              source text not null,
+              model text not null,
+              input_tokens integer not null default 0 check(input_tokens >= 0 and typeof(input_tokens) = 'integer'),
+              billable_uncached_input_tokens integer not null default 0 check(billable_uncached_input_tokens >= 0 and typeof(billable_uncached_input_tokens) = 'integer'),
+              output_tokens integer not null default 0 check(output_tokens >= 0 and typeof(output_tokens) = 'integer'),
+              cached_input_tokens integer not null default 0 check(cached_input_tokens >= 0 and typeof(cached_input_tokens) = 'integer'),
+              cache_creation_input_tokens integer not null default 0 check(cache_creation_input_tokens >= 0 and typeof(cache_creation_input_tokens) = 'integer'),
+              reasoning_output_tokens integer not null default 0 check(reasoning_output_tokens >= 0 and typeof(reasoning_output_tokens) = 'integer'),
+              unattributed_total_tokens integer not null default 0 check(unattributed_total_tokens >= 0 and typeof(unattributed_total_tokens) = 'integer'),
+              total_tokens integer not null default 0 check(total_tokens >= 0 and typeof(total_tokens) = 'integer'),
+              observation_count integer not null default 0 check(observation_count >= 0 and typeof(observation_count) = 'integer'),
+              primary key (bucket_start_utc, source, model)
+            );
+            -- rollup 版本与 ready/invalid 状态元数据。migration 只建表，不预写 schema_version/state；
+            -- 完整 rebuild 并翻转到 ready 由 Task 5 拥有。
+            create table if not exists usage_rollup_metadata (
               key text primary key,
               value text not null
             );
@@ -334,52 +418,70 @@ impl UsageStore {
         if let Some(tracking_window_id) = tracking_window_id {
             self.validate_tracking_window(tracking_window_id, observation.observed_at)?;
         }
-        let dedupe_key = compute_dedupe_key(observation);
-        let confidence = match observation.source_record_id_confidence {
-            SourceRecordIdConfidence::Exact => "exact",
-            SourceRecordIdConfidence::Fallback => "fallback",
-        };
-        let inserted = self.conn.execute(
-            r#"
-            insert or ignore into token_observations (
-              tracking_window_id, source, adapter_version, source_record_id, source_record_id_confidence,
-              session_id, turn_id, turn_boundary_id, source_path, line_no, byte_offset,
-              input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-              reasoning_output_tokens, total_tokens, cumulative_total_tokens, model, cwd,
-              observed_at, token_payload_hash, dedupe_key
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
-            "#,
-            params![
-                tracking_window_id,
-                observation.source,
-                observation.adapter_version,
-                observation.source_record_id,
-                confidence,
-                observation.session_id,
-                observation.turn_id,
-                observation.turn_boundary_id,
-                observation.source_path,
-                observation.line_no,
-                observation.byte_offset,
-                observation.input_tokens,
-                observation.output_tokens,
-                observation.cached_input_tokens,
-                observation.cache_creation_input_tokens,
-                observation.reasoning_output_tokens,
-                observation.total_tokens,
-                observation.cumulative_total_tokens,
-                observation.model,
-                observation.cwd,
-                observation.observed_at.to_rfc3339(),
-                observation.token_payload_hash,
-                dedupe_key,
-            ],
-        )?;
+
+        // 原子双写：raw insert 与 rollup upsert 位于同一事务，任一步失败先整体回滚。
+        // 用 unchecked_transaction 从 &self 取事务，避免为适配 IngestScheduler 改成 &mut self。
+        let tx = self.conn.unchecked_transaction()?;
+        let inserted = insert_raw_observation(&tx, observation, tracking_window_id)?;
+
+        // dedupe 命中：raw 与 rollup 都不变，直接提交空事务。
         if inserted == 0 {
-            Ok(InsertOutcome::Duplicate)
-        } else {
-            Ok(InsertOutcome::Inserted)
+            tx.commit()?;
+            return Ok(InsertOutcome::Duplicate);
         }
+
+        // untracked（测试用）观测永不写 rollup。
+        if tracking_window_id.is_none() {
+            tx.commit()?;
+            return Ok(InsertOutcome::Inserted);
+        }
+
+        // OVERRIDE B：state=invalid 即 raw-only 降级，跳过 rollup upsert 且不报错；
+        // 缺 state（migration 未写）视为“可增量双写”，从首条 insert 起就增量维护 rollup。
+        // 增量维护不要求 schema_version==current（版本 gating 只在 Task 5/6 管查询就绪）。
+        if rollup_state(&tx)?.as_deref() == Some(ROLLUP_STATE_INVALID) {
+            tx.commit()?;
+            return Ok(InsertOutcome::Inserted);
+        }
+
+        match upsert_profile_rollup(&tx, observation) {
+            Ok(()) => {
+                tx.commit()?;
+                Ok(InsertOutcome::Inserted)
+            }
+            // OVERRIDE A：rollup 是派生模型，其写入失败不能丢失唯一事实源 raw。
+            Err(_rollup_error) => {
+                // 1. 回滚原双写事务（此时 raw 尚未持久化）。
+                drop(tx);
+                // 2/3. 新事务只写 raw 并持久化 state=invalid，进入 raw-only 降级模式。
+                //     沿用相同 dedupe key，重试幂等。若此事务也失败则按 storage failure 上报，
+                //     不能声称已保存。
+                self.write_raw_only_and_mark_invalid(observation, tracking_window_id)?;
+                // 4. raw 确已持久化，返回 Inserted 而非错误。
+                Ok(InsertOutcome::Inserted)
+            }
+        }
+    }
+
+    /// raw-only 降级写入：新事务内写 raw observation + 标记 rollup state=invalid。
+    /// 仅在检测到 rollup 写失败后调用；沿用相同 dedupe key 保证幂等重试。
+    fn write_raw_only_and_mark_invalid(
+        &self,
+        observation: &NormalizedObservation,
+        tracking_window_id: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        insert_raw_observation(&tx, observation, tracking_window_id)?;
+        tx.execute(
+            r#"
+            insert into usage_rollup_metadata (key, value)
+            values (?1, ?2)
+            on conflict(key) do update set value = excluded.value
+            "#,
+            params![ROLLUP_METADATA_STATE_KEY, ROLLUP_STATE_INVALID],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn validate_tracking_window(
@@ -1080,4 +1182,124 @@ impl UsageStore {
             .optional()?;
         Ok(value)
     }
+}
+
+/// 读取 rollup 状态机当前 state（None 表示 migration 未写、尚未 rebuild）。
+/// 在事务内读取，保证与同事务写入一致。
+fn rollup_state(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<Option<String>> {
+    tx.query_row(
+        "select value from usage_rollup_metadata where key = ?1",
+        params![ROLLUP_METADATA_STATE_KEY],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// 写入 raw observation（唯一事实源）。封装原 23 列 insert-or-ignore，列映射保持不变。
+/// 返回受影响行数：1 表示新插入，0 表示 dedupe 命中。
+fn insert_raw_observation(
+    tx: &rusqlite::Transaction<'_>,
+    observation: &NormalizedObservation,
+    tracking_window_id: Option<i64>,
+) -> anyhow::Result<usize> {
+    let dedupe_key = compute_dedupe_key(observation);
+    let confidence = match observation.source_record_id_confidence {
+        SourceRecordIdConfidence::Exact => "exact",
+        SourceRecordIdConfidence::Fallback => "fallback",
+    };
+    let inserted = tx.execute(
+        r#"
+        insert or ignore into token_observations (
+          tracking_window_id, source, adapter_version, source_record_id, source_record_id_confidence,
+          session_id, turn_id, turn_boundary_id, source_path, line_no, byte_offset,
+          input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+          reasoning_output_tokens, total_tokens, cumulative_total_tokens, model, cwd,
+          observed_at, token_payload_hash, dedupe_key
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+        "#,
+        params![
+            tracking_window_id,
+            observation.source,
+            observation.adapter_version,
+            observation.source_record_id,
+            confidence,
+            observation.session_id,
+            observation.turn_id,
+            observation.turn_boundary_id,
+            observation.source_path,
+            observation.line_no,
+            observation.byte_offset,
+            observation.input_tokens,
+            observation.output_tokens,
+            observation.cached_input_tokens,
+            observation.cache_creation_input_tokens,
+            observation.reasoning_output_tokens,
+            observation.total_tokens,
+            observation.cumulative_total_tokens,
+            observation.model,
+            observation.cwd,
+            observation.observed_at.to_rfc3339(),
+            observation.token_payload_hash,
+            dedupe_key,
+        ],
+    )?;
+    Ok(inserted)
+}
+
+/// 增量维护派生 rollup：把该观测累加进对应 (bucket, source, model) 桶。
+///
+/// billable_uncached_input_tokens 与 unattributed_total_tokens 用 SQLite CASE/max 表达，
+/// 与 Task 2 core 函数（`billable_uncached_input_tokens`/`unattributed_total_tokens`）语义一致，
+/// 保证增量 upsert == 未来 full rebuild == retention rebuild 使用同一数值域。
+/// model=NULL 规范化为 ''，但不改动 raw 表中的 NULL。整数域运算，不得转 REAL。
+fn upsert_profile_rollup(
+    tx: &rusqlite::Transaction<'_>,
+    observation: &NormalizedObservation,
+) -> anyhow::Result<()> {
+    let bucket = bucket_start_utc(observation.observed_at);
+    let model_key = normalize_model_key(observation.model.as_deref());
+    tx.execute(
+        r#"
+        insert into usage_rollups_15m (
+          bucket_start_utc, source, model,
+          input_tokens, billable_uncached_input_tokens, output_tokens,
+          cached_input_tokens, cache_creation_input_tokens, reasoning_output_tokens,
+          unattributed_total_tokens, total_tokens, observation_count
+        ) values (
+          ?1, ?2, ?3,
+          ?4,
+          max(?4 - ?7 - ?8, 0),
+          ?5,
+          ?7, ?8, ?6,
+          case when ?4 = 0 and ?5 = 0 and ?7 = 0 and ?8 = 0 and ?6 = 0 then max(?9, 0) else 0 end,
+          ?9, 1
+        )
+        on conflict(bucket_start_utc, source, model) do update set
+          input_tokens = input_tokens + excluded.input_tokens,
+          billable_uncached_input_tokens =
+            billable_uncached_input_tokens + excluded.billable_uncached_input_tokens,
+          output_tokens = output_tokens + excluded.output_tokens,
+          cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
+          cache_creation_input_tokens =
+            cache_creation_input_tokens + excluded.cache_creation_input_tokens,
+          reasoning_output_tokens = reasoning_output_tokens + excluded.reasoning_output_tokens,
+          unattributed_total_tokens =
+            unattributed_total_tokens + excluded.unattributed_total_tokens,
+          total_tokens = total_tokens + excluded.total_tokens,
+          observation_count = observation_count + excluded.observation_count
+        "#,
+        params![
+            bucket,
+            observation.source,
+            model_key,
+            observation.input_tokens,
+            observation.output_tokens,
+            observation.reasoning_output_tokens,
+            observation.cached_input_tokens,
+            observation.cache_creation_input_tokens,
+            observation.total_tokens,
+        ],
+    )?;
+    Ok(())
 }

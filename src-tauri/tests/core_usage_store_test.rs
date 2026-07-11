@@ -328,6 +328,253 @@ fn state_value(db_path: &Path, key: &str) -> Option<String> {
         .ok()
 }
 
+/// 读取 rollup metadata（state / schema_version 等）；缺表或缺行时返回 None。
+fn rollup_metadata_value(db_path: &Path, key: &str) -> Option<String> {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            "select value from usage_rollup_metadata where key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+fn rollup_row_count(db_path: &Path) -> i64 {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row("select count(*) from usage_rollups_15m", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+#[derive(Debug)]
+struct RollupRow {
+    bucket_start_utc: i64,
+    source: String,
+    model: String,
+    input_tokens: i64,
+    billable_uncached_input_tokens: i64,
+    output_tokens: i64,
+    cached_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+    unattributed_total_tokens: i64,
+    total_tokens: i64,
+    observation_count: i64,
+}
+
+fn rollup_rows(db_path: &Path) -> Vec<RollupRow> {
+    let conn = Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            r#"
+            select bucket_start_utc, source, model, input_tokens, billable_uncached_input_tokens,
+                   output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                   reasoning_output_tokens, unattributed_total_tokens, total_tokens, observation_count
+            from usage_rollups_15m
+            order by bucket_start_utc, source, model
+            "#,
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(RollupRow {
+                bucket_start_utc: row.get(0)?,
+                source: row.get(1)?,
+                model: row.get(2)?,
+                input_tokens: row.get(3)?,
+                billable_uncached_input_tokens: row.get(4)?,
+                output_tokens: row.get(5)?,
+                cached_input_tokens: row.get(6)?,
+                cache_creation_input_tokens: row.get(7)?,
+                reasoning_output_tokens: row.get(8)?,
+                unattributed_total_tokens: row.get(9)?,
+                total_tokens: row.get(10)?,
+                observation_count: row.get(11)?,
+            })
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+#[test]
+fn profile_rollup_write_migration_creates_tables_without_version() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+
+    UsageStore::open(&db_path).unwrap();
+
+    // migration 只建 schema：两张表存在，但不预写 schema_version / state（Task 5 拥有 rebuild）。
+    assert!(table_exists(&db_path, "usage_rollups_15m"));
+    assert!(table_exists(&db_path, "usage_rollup_metadata"));
+    assert_eq!(rollup_metadata_value(&db_path, "schema_version"), None);
+    assert_eq!(rollup_metadata_value(&db_path, "state"), None);
+    assert_eq!(rollup_row_count(&db_path), 0);
+}
+
+#[test]
+fn profile_rollup_write_tracked_insert_writes_normalized_rollup_row() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let store = UsageStore::open(&db_path).unwrap();
+    let bucket_time = Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap();
+    let expected_bucket = Utc
+        .with_ymd_and_hms(2026, 7, 11, 12, 0, 0)
+        .unwrap()
+        .timestamp();
+
+    // model=None 必须规范化为空字符串 key；billable/unattributed 走 Task 2 的 clamp/CASE 语义。
+    let component = cost_observation(
+        "rollup-component",
+        None,
+        1_000_000,
+        500_000,
+        250_000,
+        100_000,
+        50_000,
+        1_900_000,
+        bucket_time,
+    );
+    insert_tracked(&store, &component).unwrap();
+
+    // 同 bucket/source/model 的 total-only 观测应累加进同一 rollup 行，并单独累积 unattributed。
+    let total_only = cost_observation(
+        "rollup-total-only",
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1_000_000,
+        bucket_time + chrono::Duration::minutes(5),
+    );
+    insert_tracked(&store, &total_only).unwrap();
+
+    assert_eq!(observation_count(&db_path), 2);
+    let rows = rollup_rows(&db_path);
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.bucket_start_utc, expected_bucket);
+    assert_eq!(row.source, "traex");
+    assert_eq!(row.model, "");
+    assert_eq!(row.input_tokens, 1_000_000);
+    assert_eq!(row.billable_uncached_input_tokens, 650_000);
+    assert_eq!(row.output_tokens, 500_000);
+    assert_eq!(row.cached_input_tokens, 250_000);
+    assert_eq!(row.cache_creation_input_tokens, 100_000);
+    assert_eq!(row.reasoning_output_tokens, 50_000);
+    assert_eq!(row.unattributed_total_tokens, 1_000_000);
+    assert_eq!(row.total_tokens, 2_900_000);
+    assert_eq!(row.observation_count, 2);
+}
+
+#[test]
+fn profile_rollup_write_duplicate_insert_does_not_change_rollup() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let store = UsageStore::open(&db_path).unwrap();
+    let observed_at = Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap();
+    let row = observation("rollup-dup", 100, observed_at);
+
+    assert_eq!(
+        insert_tracked(&store, &row).unwrap(),
+        InsertOutcome::Inserted
+    );
+    assert_eq!(
+        insert_tracked(&store, &row).unwrap(),
+        InsertOutcome::Duplicate
+    );
+
+    let rows = rollup_rows(&db_path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].total_tokens, 100);
+    assert_eq!(rows[0].observation_count, 1);
+}
+
+#[test]
+fn profile_rollup_write_untracked_insert_writes_no_rollup_row() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let store = UsageStore::open(&db_path).unwrap();
+    let observed_at = Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap();
+
+    store
+        .insert_untracked_observation_for_test(&observation("rollup-untracked", 100, observed_at))
+        .unwrap();
+
+    assert_eq!(observation_count(&db_path), 1);
+    assert_eq!(rollup_row_count(&db_path), 0);
+}
+
+#[test]
+fn profile_rollup_write_failure_keeps_raw_and_marks_invalid() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    UsageStore::open(&db_path).unwrap();
+
+    // 在 rollup 表安装 BEFORE INSERT 失败触发器，模拟派生模型写入故障。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            r#"
+            create trigger fail_rollup_insert
+            before insert on usage_rollups_15m
+            begin
+              select raise(fail, 'rollup write failed');
+            end;
+            "#,
+        )
+        .unwrap();
+
+    let store = UsageStore::open(&db_path).unwrap();
+    let first = observation(
+        "rollup-fail-1",
+        100,
+        Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap(),
+    );
+
+    // OVERRIDE A：raw 是唯一事实源，rollup 写失败不能丢 raw；返回 Inserted 而非错误。
+    assert_eq!(
+        insert_tracked(&store, &first).unwrap(),
+        InsertOutcome::Inserted
+    );
+    assert_eq!(observation_count(&db_path), 1);
+    assert_eq!(rollup_row_count(&db_path), 0);
+    assert_eq!(
+        rollup_metadata_value(&db_path, "state"),
+        Some("invalid".to_string())
+    );
+
+    // 进入 raw-only 降级：后续 tracked insert 只写 raw，rollup 不增长，也不再报错。
+    let second = observation(
+        "rollup-fail-2",
+        200,
+        Utc.with_ymd_and_hms(2026, 7, 11, 12, 1, 0).unwrap(),
+    );
+    assert_eq!(
+        insert_tracked(&store, &second).unwrap(),
+        InsertOutcome::Inserted
+    );
+    assert_eq!(observation_count(&db_path), 2);
+    assert_eq!(rollup_row_count(&db_path), 0);
+}
+
+#[test]
+fn profile_rollup_write_connection_uses_wal_full_busy_timeout() {
+    let dir = tempdir().unwrap();
+    let store = UsageStore::open(&dir.path().join("token-fire.sqlite")).unwrap();
+
+    // OVERRIDE C：Profile 查询将与 ingest writer 真正并发，WAL + busy_timeout 是正确性而非润色。
+    let pragmas = store.connection_pragmas().unwrap();
+    assert_eq!(pragmas.journal_mode.to_lowercase(), "wal");
+    assert_eq!(pragmas.busy_timeout, 5000);
+    assert_eq!(pragmas.synchronous, 2); // FULL
+    assert_eq!(pragmas.wal_autocheckpoint, 1000);
+}
+
 #[test]
 fn opening_legacy_store_adds_tracking_window_id_before_indexing_it() {
     let dir = tempdir().unwrap();
