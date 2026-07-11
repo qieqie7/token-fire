@@ -610,7 +610,7 @@ fn profile_rollup_rebuild_status_requires_rebuild_on_version_mismatch() {
 }
 
 #[test]
-fn profile_rollup_rebuild_status_requires_rebuild_on_checksum_mismatch() {
+fn profile_rollup_status_stays_o1_ready_and_audit_detects_checksum_mismatch() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("token-fire.sqlite");
     let mut store = UsageStore::open(&db_path).unwrap();
@@ -620,8 +620,10 @@ fn profile_rollup_rebuild_status_requires_rebuild_on_checksum_mismatch() {
         store.profile_rollup_status().unwrap(),
         ProfileRollupStatus::Ready { .. }
     ));
+    // 一致性审计在健康状态下通过。
+    assert!(store.profile_rollup_consistency_audit().unwrap());
 
-    // 篡改一行 rollup total，使全局守恒 checksum 与 raw 不一致（state/version 仍 ready）。
+    // 篡改一行 rollup total，使全局守恒与 raw 不一致（state/version 仍 ready）。
     Connection::open(&db_path)
         .unwrap()
         .execute(
@@ -630,12 +632,14 @@ fn profile_rollup_rebuild_status_requires_rebuild_on_checksum_mismatch() {
         )
         .unwrap();
 
-    assert_eq!(
+    // 正常 Ready 启动路径是 O(1)：只看 state/version，不扫描 raw，故仍判定 Ready（spec 要求
+    // “Ready 启动不得扫描 raw”）。守恒失配只由显式低频审计发现，不进普通启动路径。
+    assert!(matches!(
         store.profile_rollup_status().unwrap(),
-        ProfileRollupStatus::RebuildRequired {
-            reason: "checksum_mismatch"
-        }
-    );
+        ProfileRollupStatus::Ready { .. }
+    ));
+    // 显式一致性审计能检出全局守恒失配。
+    assert!(!store.profile_rollup_consistency_audit().unwrap());
 }
 
 #[test]

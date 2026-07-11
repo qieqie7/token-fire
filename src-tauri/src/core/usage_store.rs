@@ -470,10 +470,10 @@ impl UsageStore {
 
     /// 启动/rebuild 决策用的 rollup 就绪检查。
     ///
-    /// 仅在此处扫描 raw 做一次全局 token/count 守恒 checksum；普通 Profile query（Task 6）
-    /// 只读 `state`/`schema_version`，绝不每次读都重扫 raw。
-    /// 判定 Ready 需三者同时成立：state==ready、schema_version==当前版本、全局守恒通过。
-    /// 否则返回稳定 reason（state_missing / state_invalid / version_mismatch / checksum_mismatch）。
+    /// 按 spec“App 启动执行 O(1) 状态检查：state=ready 且 version current 直接启动，不扫描 raw”，
+    /// 此处只读 `state` + `schema_version` 两行 metadata，绝不扫描 raw。全局守恒 checksum 属于
+    /// “显式诊断 / 低频 maintenance”，见 `profile_rollup_consistency_audit`，不在正常启动路径执行。
+    /// Ready 需 state==ready 且 schema_version==当前版本；否则返回稳定 reason。
     pub fn profile_rollup_status(&self) -> anyhow::Result<ProfileRollupStatus> {
         let state = self.rollup_metadata_value(ROLLUP_METADATA_STATE_KEY)?;
         match state.as_deref() {
@@ -498,18 +498,19 @@ impl UsageStore {
             });
         }
 
-        // 全局守恒 checksum：raw 与 rollup 的 8 个 token 分量 + observation_count 逐项相等。
-        // 这是诊断级别的全局校验；逐 key 正确性由“增量 upsert 与 rebuild 共用同一
-        // 分组 + clamp 方言”保证，不能仅凭全局和相等推断逐 key 正确。
-        if self.rollup_conservation_totals()? != self.raw_conservation_totals()? {
-            return Ok(ProfileRollupStatus::RebuildRequired {
-                reason: "checksum_mismatch",
-            });
-        }
-
         Ok(ProfileRollupStatus::Ready {
             schema_version: PROFILE_ROLLUP_SCHEMA_VERSION.to_string(),
         })
+    }
+
+    /// 显式一致性审计（仅供低频 maintenance / 诊断，不在正常 Ready 启动执行）：
+    /// 扫描 raw 做全局 token/count 守恒 checksum 与 rollup 比对。返回 true 表示守恒通过。
+    ///
+    /// 注意：全局守恒只是诊断，不能替代逐 key 正确性——逐 key 正确性由“增量 upsert、retention
+    /// 边界重建、full rebuild 共用同一分组 + clamp 方言”从构造上保证（rebuild 的 shadow 表即按
+    /// (bucket, source, model) 分组聚合 raw 得到）。若未来支持任意历史修改，应在此扩展逐 key 比对。
+    pub fn profile_rollup_consistency_audit(&self) -> anyhow::Result<bool> {
+        Ok(self.rollup_conservation_totals()? == self.raw_conservation_totals()?)
     }
 
     /// 启动维护入口：Ready 直接返回 rebuilt:false（不重复重建）；否则触发原子 rebuild。
