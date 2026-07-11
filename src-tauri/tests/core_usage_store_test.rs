@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use chrono::{Datelike, Local, TimeZone, Utc};
+use chrono::{Datelike, FixedOffset, Local, Offset, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use tempfile::tempdir;
 use token_fire::core::observation::{NormalizedObservation, SourceRecordIdConfidence};
@@ -2631,4 +2631,191 @@ fn widget_cost_summary_today_ends_at_now_and_seven_days_is_rolling() {
     assert_eq!(summary.generated_at, now_utc);
     assert_eq!(summary.today.total_tokens, 1_000_000);
     assert_eq!(summary.seven_days.total_tokens, 3_000_000);
+}
+
+// 时区参数化用例：直接用 chrono_tz::Tz 驱动 period_bounds / empty_period_usage_trend，
+// 校验本地日历边界与 DST resolver 在非 Local 时区下的行为。
+#[test]
+fn profile_calendar_tz_kolkata_today_starts_at_local_midnight() {
+    let tz = chrono_tz::Asia::Kolkata;
+    let now_local = tz
+        .with_ymd_and_hms(2026, 7, 8, 12, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+
+    let (start, end) =
+        token_fire::core::profile::period_bounds(ProfilePeriod::Today, now_utc, now_local).unwrap();
+
+    assert_eq!(end, now_utc);
+    // Kolkata 本地 00:00 (+05:30) 对应前一日 18:30 UTC。
+    let expected_start = Utc.with_ymd_and_hms(2026, 7, 7, 18, 30, 0).unwrap();
+    assert_eq!(start, expected_start);
+
+    let start_local = start.with_timezone(&tz);
+    assert_eq!(start_local.date_naive(), now_local.date_naive());
+    assert_eq!(start_local.format("%H:%M:%S").to_string(), "00:00:00");
+    assert_eq!(
+        start_local.offset().fix(),
+        FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap()
+    );
+}
+
+#[test]
+fn profile_calendar_tz_kathmandu_today_bounds_and_trend_use_local_midnight() {
+    let tz = chrono_tz::Asia::Kathmandu;
+    let now_local = tz.with_ymd_and_hms(2026, 7, 8, 9, 15, 0).single().unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+
+    let (start, _end) =
+        token_fire::core::profile::period_bounds(ProfilePeriod::Today, now_utc, now_local).unwrap();
+    // Kathmandu 本地 00:00 (+05:45) 对应前一日 18:15 UTC。
+    let expected_start = Utc.with_ymd_and_hms(2026, 7, 7, 18, 15, 0).unwrap();
+    assert_eq!(start, expected_start);
+
+    let trend = token_fire::core::profile::empty_period_usage_trend(
+        ProfilePeriod::Today,
+        now_utc,
+        now_local,
+    )
+    .unwrap();
+    assert_eq!(trend.buckets.len(), 24);
+    let first = trend.buckets.first().unwrap();
+    assert_eq!(first.started_at, expected_start);
+    let first_local = first.started_at.with_timezone(&tz);
+    assert_eq!(first_local.format("%H:%M:%S").to_string(), "00:00:00");
+    assert_eq!(
+        first_local.offset().fix(),
+        FixedOffset::east_opt(5 * 3600 + 45 * 60).unwrap()
+    );
+}
+
+#[test]
+fn profile_calendar_tz_new_york_spring_forward_gap_resolves_next_valid() {
+    let tz = chrono_tz::America::New_York;
+    // 2026-03-08 是美国夏令时开始日：本地 02:00 -> 03:00 存在缺口。
+    let now_local = tz.with_ymd_and_hms(2026, 3, 8, 12, 0, 0).single().unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+
+    let trend = token_fire::core::profile::empty_period_usage_trend(
+        ProfilePeriod::Today,
+        now_utc,
+        now_local,
+    )
+    .unwrap();
+    assert_eq!(trend.buckets.len(), 24);
+
+    // started_at 单调非递减；缺口小时坍缩到下一有效瞬间，可能与相邻桶相等。
+    for pair in trend.buckets.windows(2) {
+        assert!(
+            pair[1].started_at >= pair[0].started_at,
+            "started_at must be non-decreasing across DST gap"
+        );
+    }
+    // 每个桶区间非负。
+    for bucket in &trend.buckets {
+        assert!(
+            bucket.ended_at >= bucket.started_at,
+            "bucket interval must be non-negative"
+        );
+    }
+
+    // 缺口小时（本地 02:00 不存在）经 resolver 落到下一有效瞬间 = 本地 03:00 EDT = 07:00 UTC。
+    let gap_bucket = trend.buckets.iter().find(|b| b.key == "h02").unwrap();
+    let expected_next_valid = tz
+        .from_local_datetime(
+            &chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
+                .unwrap()
+                .and_hms_opt(3, 0, 0)
+                .unwrap(),
+        )
+        .earliest()
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(gap_bucket.started_at, expected_next_valid);
+    assert_eq!(
+        gap_bucket.started_at,
+        Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).unwrap()
+    );
+}
+
+#[test]
+fn profile_calendar_tz_new_york_fall_back_uses_earliest_instant() {
+    let tz = chrono_tz::America::New_York;
+    // 2026-11-01 是美国夏令时结束日：本地 01:00 出现两次。
+    let now_local = tz.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).single().unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+
+    let trend = token_fire::core::profile::empty_period_usage_trend(
+        ProfilePeriod::Today,
+        now_utc,
+        now_local,
+    )
+    .unwrap();
+    assert_eq!(trend.buckets.len(), 24);
+
+    for pair in trend.buckets.windows(2) {
+        assert!(
+            pair[1].started_at >= pair[0].started_at,
+            "started_at must be non-decreasing across DST fall-back"
+        );
+    }
+
+    // 重复的 01:00 本地时间使用 earliest 瞬间（EDT，-04:00 => 05:00 UTC）。
+    let repeated = trend.buckets.iter().find(|b| b.key == "h01").unwrap();
+    let expected_earliest = tz
+        .from_local_datetime(
+            &chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+                .unwrap()
+                .and_hms_opt(1, 0, 0)
+                .unwrap(),
+        )
+        .earliest()
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(repeated.started_at, expected_earliest);
+    assert_eq!(
+        repeated.started_at,
+        Utc.with_ymd_and_hms(2026, 11, 1, 5, 0, 0).unwrap()
+    );
+}
+
+#[test]
+fn profile_calendar_tz_kolkata_week_month_year_start_at_local_midnight() {
+    let tz = chrono_tz::Asia::Kolkata;
+    // 2026-07-08 是周三。
+    let now_local = tz.with_ymd_and_hms(2026, 7, 8, 12, 0, 0).single().unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+
+    let (week_start, _) =
+        token_fire::core::profile::period_bounds(ProfilePeriod::ThisWeek, now_utc, now_local)
+            .unwrap();
+    let (month_start, _) =
+        token_fire::core::profile::period_bounds(ProfilePeriod::ThisMonth, now_utc, now_local)
+            .unwrap();
+    let (year_start, _) =
+        token_fire::core::profile::period_bounds(ProfilePeriod::ThisYear, now_utc, now_local)
+            .unwrap();
+
+    let week_local = week_start.with_timezone(&tz);
+    assert_eq!(week_local.weekday(), chrono::Weekday::Mon);
+    assert_eq!(week_local.format("%H:%M:%S").to_string(), "00:00:00");
+    let expected_monday = Utc.with_ymd_and_hms(2026, 7, 5, 18, 30, 0).unwrap();
+    assert_eq!(week_start, expected_monday);
+
+    let month_local = month_start.with_timezone(&tz);
+    assert_eq!(
+        (month_local.year(), month_local.month(), month_local.day()),
+        (2026, 7, 1)
+    );
+    assert_eq!(month_local.format("%H:%M:%S").to_string(), "00:00:00");
+
+    let year_local = year_start.with_timezone(&tz);
+    assert_eq!(
+        (year_local.year(), year_local.month(), year_local.day()),
+        (2026, 1, 1)
+    );
+    assert_eq!(year_local.format("%H:%M:%S").to_string(), "00:00:00");
+    let expected_year = Utc.with_ymd_and_hms(2025, 12, 31, 18, 30, 0).unwrap();
+    assert_eq!(year_start, expected_year);
 }
