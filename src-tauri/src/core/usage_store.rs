@@ -19,6 +19,7 @@ use crate::core::profile::{
 };
 use crate::core::profile_rollup::{
     bucket_start_utc, normalize_model_key, PROFILE_ROLLUP_BUCKET_SECONDS,
+    PROFILE_ROLLUP_SCHEMA_VERSION,
 };
 use crate::core::usage_series::{
     average_tokens_per_bucket, bucket_index_for, empty_usage_buckets, WidgetUsageSeries,
@@ -44,7 +45,11 @@ pub const DEFAULT_RETENTION_MIN_INTERVAL_HOURS: i64 = 24;
 /// rollup readiness 状态机的 metadata key 与取值。migration 不预写这些；
 /// 完整 rebuild + 翻转 ready + 写 schema_version 由 Task 5 拥有。
 const ROLLUP_METADATA_STATE_KEY: &str = "state";
+const ROLLUP_METADATA_SCHEMA_VERSION_KEY: &str = "schema_version";
 const ROLLUP_STATE_INVALID: &str = "invalid";
+const ROLLUP_STATE_READY: &str = "ready";
+/// rebuild 用的 shadow 表名；rebuild 结束后 rename 为正式表，任何残留在 rebuild 起始处清理。
+const ROLLUP_SHADOW_TABLE: &str = "usage_rollups_15m_rebuild";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
@@ -82,6 +87,22 @@ pub struct RetentionDiagnostics {
     pub last_deleted_observations: Option<usize>,
     pub last_failure_at: Option<String>,
     pub last_error_kind: Option<String>,
+}
+
+/// Profile rollup 读模型的就绪状态。
+/// `Ready` 表示可直接读 rollup；`RebuildRequired` 携带稳定 reason 字符串供诊断日志分类。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileRollupStatus {
+    Ready { schema_version: String },
+    RebuildRequired { reason: &'static str },
+}
+
+/// rebuild / ensure 的结果：是否真正重建、当前 rollup 行数、写入的 schema_version。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileRollupRebuildOutcome {
+    pub rebuilt: bool,
+    pub rollup_row_count: usize,
+    pub schema_version: String,
 }
 
 pub struct UsageStore {
@@ -429,6 +450,168 @@ impl UsageStore {
         observation: &NormalizedObservation,
     ) -> anyhow::Result<InsertOutcome> {
         self.insert_observation_inner(observation, None)
+    }
+
+    /// 启动/rebuild 决策用的 rollup 就绪检查。
+    ///
+    /// 仅在此处扫描 raw 做一次全局 token/count 守恒 checksum；普通 Profile query（Task 6）
+    /// 只读 `state`/`schema_version`，绝不每次读都重扫 raw。
+    /// 判定 Ready 需三者同时成立：state==ready、schema_version==当前版本、全局守恒通过。
+    /// 否则返回稳定 reason（state_missing / state_invalid / version_mismatch / checksum_mismatch）。
+    pub fn profile_rollup_status(&self) -> anyhow::Result<ProfileRollupStatus> {
+        let state = self.rollup_metadata_value(ROLLUP_METADATA_STATE_KEY)?;
+        match state.as_deref() {
+            None => {
+                return Ok(ProfileRollupStatus::RebuildRequired {
+                    reason: "state_missing",
+                })
+            }
+            Some(ROLLUP_STATE_READY) => {}
+            Some(_) => {
+                // invalid 或任何非 ready 取值都需 rebuild。
+                return Ok(ProfileRollupStatus::RebuildRequired {
+                    reason: "state_invalid",
+                });
+            }
+        }
+
+        let schema_version = self.rollup_metadata_value(ROLLUP_METADATA_SCHEMA_VERSION_KEY)?;
+        if schema_version.as_deref() != Some(PROFILE_ROLLUP_SCHEMA_VERSION) {
+            return Ok(ProfileRollupStatus::RebuildRequired {
+                reason: "version_mismatch",
+            });
+        }
+
+        // 全局守恒 checksum：raw 与 rollup 的 8 个 token 分量 + observation_count 逐项相等。
+        // 这是诊断级别的全局校验；逐 key 正确性由“增量 upsert 与 rebuild 共用同一
+        // 分组 + clamp 方言”保证，不能仅凭全局和相等推断逐 key 正确。
+        if self.rollup_conservation_totals()? != self.raw_conservation_totals()? {
+            return Ok(ProfileRollupStatus::RebuildRequired {
+                reason: "checksum_mismatch",
+            });
+        }
+
+        Ok(ProfileRollupStatus::Ready {
+            schema_version: PROFILE_ROLLUP_SCHEMA_VERSION.to_string(),
+        })
+    }
+
+    /// 启动维护入口：Ready 直接返回 rebuilt:false（不重复重建）；否则触发原子 rebuild。
+    pub fn ensure_profile_rollup_ready(&mut self) -> anyhow::Result<ProfileRollupRebuildOutcome> {
+        if let ProfileRollupStatus::Ready { schema_version } = self.profile_rollup_status()? {
+            return Ok(ProfileRollupRebuildOutcome {
+                rebuilt: false,
+                rollup_row_count: self.rollup_row_count()? as usize,
+                schema_version,
+            });
+        }
+        self.rebuild_profile_rollups()
+    }
+
+    /// 用 shadow table 原子重建整张 rollup：从 raw 全量聚合 → 校验守恒 → drop+rename 换表。
+    ///
+    /// 两段事务，保证“崩溃只剩完整旧状态或完整新状态”：
+    /// 1) 先在独立事务持久化 state=invalid（rebuild 进行中标记）。若中途崩溃 reopen 后仍是
+    ///    invalid，增量双写停用、等待再次 rebuild，不会看到半成品 ready。
+    /// 2) rebuild body 在单个 Immediate 事务内完成 shadow 建表/聚合/校验/drop/rename/写 ready+
+    ///    version；任一步失败 → 事务 drop 回滚 → 正式表与旧 version 完全不变，state 停留 invalid。
+    ///    换表（drop 正式表 + rename shadow）位于同一事务，绝不出现半换状态。
+    pub fn rebuild_profile_rollups(&mut self) -> anyhow::Result<ProfileRollupRebuildOutcome> {
+        // 第 1 段：独立事务先标记 invalid（durable 的“重建进行中”）。
+        self.mark_rollup_invalid()?;
+
+        // 第 2 段：原子 rebuild body。
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        rebuild_profile_rollups_in_tx(&tx)?;
+        // 写 schema_version 与 ready 状态（与换表同事务，保证一致翻转）。
+        upsert_rollup_metadata(
+            &tx,
+            ROLLUP_METADATA_SCHEMA_VERSION_KEY,
+            PROFILE_ROLLUP_SCHEMA_VERSION,
+        )?;
+        upsert_rollup_metadata(&tx, ROLLUP_METADATA_STATE_KEY, ROLLUP_STATE_READY)?;
+        let rollup_row_count: i64 =
+            tx.query_row("select count(*) from usage_rollups_15m", [], |row| {
+                row.get(0)
+            })?;
+        tx.commit()?;
+
+        Ok(ProfileRollupRebuildOutcome {
+            rebuilt: true,
+            rollup_row_count: rollup_row_count as usize,
+            schema_version: PROFILE_ROLLUP_SCHEMA_VERSION.to_string(),
+        })
+    }
+
+    /// 独立事务把 rollup state 置为 invalid（rebuild 起始处调用）。
+    fn mark_rollup_invalid(&mut self) -> anyhow::Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_rollup_metadata(&tx, ROLLUP_METADATA_STATE_KEY, ROLLUP_STATE_INVALID)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 读取 rollup metadata 单值（缺表/缺行返回 None）。
+    fn rollup_metadata_value(&self, key: &str) -> anyhow::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "select value from usage_rollup_metadata where key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn rollup_row_count(&self) -> anyhow::Result<i64> {
+        self.conn
+            .query_row("select count(*) from usage_rollups_15m", [], |row| {
+                row.get(0)
+            })
+            .map_err(Into::into)
+    }
+
+    /// tracked raw 侧全局守恒聚合：与 rebuild/upsert 相同的 clamp/CASE 方言，
+    /// 顺序 input/billable/output/cached/cache_creation/reasoning/unattributed/total/count。
+    fn raw_conservation_totals(&self) -> anyhow::Result<[i64; 9]> {
+        self.conn
+            .query_row(ROLLUP_RAW_CONSERVATION_SQL, [], |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ])
+            })
+            .map_err(Into::into)
+    }
+
+    /// rollup 侧全局守恒聚合（预聚合列直接求和），列序与 raw_conservation_totals 对齐。
+    fn rollup_conservation_totals(&self) -> anyhow::Result<[i64; 9]> {
+        self.conn
+            .query_row(ROLLUP_ROLLUP_CONSERVATION_SQL, [], |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ])
+            })
+            .map_err(Into::into)
     }
 
     pub fn insert_observation_for_tracking_window(
@@ -1420,3 +1603,169 @@ fn upsert_profile_rollup(
     )?;
     Ok(())
 }
+
+/// upsert 单条 rollup metadata（state / schema_version 等），key 冲突时覆盖。
+fn upsert_rollup_metadata(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    tx.execute(
+        r#"
+        insert into usage_rollup_metadata (key, value)
+        values (?1, ?2)
+        on conflict(key) do update set value = excluded.value
+        "#,
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+/// shadow table 原子重建 body（在单个 Immediate 事务内执行；不含 metadata 翻转）。
+///
+/// 步骤：清理残留 shadow → 建与正式表约束一致的 shadow（含 typeof integer CHECK）→
+/// 一条 INSERT..SELECT 从所有 tracked raw 行按 (bucket, source, coalesce(model,'')) 聚合 →
+/// 全局守恒校验（8 分量 + count 相等）→ drop 正式表 → rename shadow 为正式表。
+/// 时间桶用 `cast(unixepoch(observed_at) as integer) / 900 * 900`，与 Rust `bucket_start_utc`
+/// 的 div_euclid 对齐（observed_at 恒为 post-1970 正 epoch，整除与 div_euclid 一致）。
+/// billable/unattributed CASE 表达式与 `upsert_profile_rollup` 完全同一方言，杜绝二义。
+fn rebuild_profile_rollups_in_tx(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    // 清理任何残留 shadow（上次崩溃遗留），保证从干净状态建表。
+    tx.execute(&format!("drop table if exists {ROLLUP_SHADOW_TABLE}"), [])?;
+
+    // shadow 表 schema 必须与正式表逐字一致（含非负 + typeof integer CHECK），
+    // 避免 SUM 溢出被静默提升为 REAL 后写回。
+    tx.execute(&rollup_table_ddl(ROLLUP_SHADOW_TABLE), [])?;
+
+    // 一条 INSERT..SELECT 全量聚合所有 tracked raw 行。
+    tx.execute(
+        &format!(
+            r#"
+            insert into {ROLLUP_SHADOW_TABLE} (
+              bucket_start_utc, source, model,
+              input_tokens, billable_uncached_input_tokens, output_tokens,
+              cached_input_tokens, cache_creation_input_tokens, reasoning_output_tokens,
+              unattributed_total_tokens, total_tokens, observation_count
+            )
+            select
+              cast(unixepoch(observed_at) as integer) / {bucket} * {bucket} as bucket_start_utc,
+              source,
+              coalesce(model, '') as model,
+              sum(input_tokens),
+              sum(max(input_tokens - cached_input_tokens - cache_creation_input_tokens, 0)),
+              sum(output_tokens),
+              sum(cached_input_tokens),
+              sum(cache_creation_input_tokens),
+              sum(reasoning_output_tokens),
+              sum(case when input_tokens = 0 and output_tokens = 0 and cached_input_tokens = 0
+                        and cache_creation_input_tokens = 0 and reasoning_output_tokens = 0
+                       then max(total_tokens, 0) else 0 end),
+              sum(total_tokens),
+              count(*)
+            from token_observations
+            where tracking_window_id is not null
+            group by bucket_start_utc, source, coalesce(model, '')
+            "#,
+            bucket = PROFILE_ROLLUP_BUCKET_SECONDS
+        ),
+        [],
+    )?;
+
+    // 全局守恒诊断：tracked raw 与 shadow 的 8 分量 + count 必须逐项相等。
+    let raw_totals = conservation_totals_in_tx(tx, ROLLUP_RAW_CONSERVATION_SQL)?;
+    let shadow_totals = conservation_totals_in_tx(
+        tx,
+        &ROLLUP_ROLLUP_CONSERVATION_SQL.replace("usage_rollups_15m", ROLLUP_SHADOW_TABLE),
+    )?;
+    if raw_totals != shadow_totals {
+        anyhow::bail!("profile rollup rebuild conservation mismatch");
+    }
+
+    // 换表：drop 正式表 + rename shadow，二者同事务，绝不出现半换状态。
+    tx.execute("drop table usage_rollups_15m", [])?;
+    tx.execute(
+        &format!("alter table {ROLLUP_SHADOW_TABLE} rename to usage_rollups_15m"),
+        [],
+    )?;
+    Ok(())
+}
+
+/// 在事务内执行一条守恒聚合 SQL，返回 9 元组（列序见 ROLLUP_RAW_CONSERVATION_SQL）。
+fn conservation_totals_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    sql: &str,
+) -> anyhow::Result<[i64; 9]> {
+    tx.query_row(sql, [], |row| {
+        Ok([
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+        ])
+    })
+    .map_err(Into::into)
+}
+
+/// 正式表 / shadow 表共用的建表 DDL（只替换表名）。约束与 migrate() 中 usage_rollups_15m 一致。
+fn rollup_table_ddl(table: &str) -> String {
+    format!(
+        r#"
+        create table {table} (
+          bucket_start_utc integer not null,
+          source text not null,
+          model text not null,
+          input_tokens integer not null default 0 check(input_tokens >= 0 and typeof(input_tokens) = 'integer'),
+          billable_uncached_input_tokens integer not null default 0 check(billable_uncached_input_tokens >= 0 and typeof(billable_uncached_input_tokens) = 'integer'),
+          output_tokens integer not null default 0 check(output_tokens >= 0 and typeof(output_tokens) = 'integer'),
+          cached_input_tokens integer not null default 0 check(cached_input_tokens >= 0 and typeof(cached_input_tokens) = 'integer'),
+          cache_creation_input_tokens integer not null default 0 check(cache_creation_input_tokens >= 0 and typeof(cache_creation_input_tokens) = 'integer'),
+          reasoning_output_tokens integer not null default 0 check(reasoning_output_tokens >= 0 and typeof(reasoning_output_tokens) = 'integer'),
+          unattributed_total_tokens integer not null default 0 check(unattributed_total_tokens >= 0 and typeof(unattributed_total_tokens) = 'integer'),
+          total_tokens integer not null default 0 check(total_tokens >= 0 and typeof(total_tokens) = 'integer'),
+          observation_count integer not null default 0 check(observation_count >= 0 and typeof(observation_count) = 'integer'),
+          primary key (bucket_start_utc, source, model)
+        )
+        "#
+    )
+}
+
+/// tracked raw 全局守恒聚合 SQL；列序：
+/// input / billable / output / cached / cache_creation / reasoning / unattributed / total / count。
+/// billable/unattributed 与 upsert_profile_rollup 同一 clamp/CASE 方言。
+const ROLLUP_RAW_CONSERVATION_SQL: &str = r#"
+    select
+      coalesce(sum(input_tokens), 0),
+      coalesce(sum(max(input_tokens - cached_input_tokens - cache_creation_input_tokens, 0)), 0),
+      coalesce(sum(output_tokens), 0),
+      coalesce(sum(cached_input_tokens), 0),
+      coalesce(sum(cache_creation_input_tokens), 0),
+      coalesce(sum(reasoning_output_tokens), 0),
+      coalesce(sum(case when input_tokens = 0 and output_tokens = 0 and cached_input_tokens = 0
+                and cache_creation_input_tokens = 0 and reasoning_output_tokens = 0
+               then max(total_tokens, 0) else 0 end), 0),
+      coalesce(sum(total_tokens), 0),
+      count(*)
+    from token_observations
+    where tracking_window_id is not null
+"#;
+
+/// rollup 侧全局守恒聚合 SQL（预聚合列直接求和），列序与 ROLLUP_RAW_CONSERVATION_SQL 对齐。
+/// rebuild body 通过替换表名复用此 SQL 对 shadow 表做同口径聚合。
+const ROLLUP_ROLLUP_CONSERVATION_SQL: &str = r#"
+    select
+      coalesce(sum(input_tokens), 0),
+      coalesce(sum(billable_uncached_input_tokens), 0),
+      coalesce(sum(output_tokens), 0),
+      coalesce(sum(cached_input_tokens), 0),
+      coalesce(sum(cache_creation_input_tokens), 0),
+      coalesce(sum(reasoning_output_tokens), 0),
+      coalesce(sum(unattributed_total_tokens), 0),
+      coalesce(sum(total_tokens), 0),
+      coalesce(sum(observation_count), 0)
+    from usage_rollups_15m
+"#;

@@ -6,10 +6,10 @@ use tempfile::tempdir;
 use token_fire::core::observation::{NormalizedObservation, SourceRecordIdConfidence};
 use token_fire::core::pricing::{PricingStatus, DEFAULT_AVERAGE_CNY_PER_1M_TOKENS};
 use token_fire::core::profile::{ProfilePeriod, ProfileSummary, RankedProfileBreakdown};
-use token_fire::core::profile_rollup::bucket_start_utc;
+use token_fire::core::profile_rollup::{bucket_start_utc, PROFILE_ROLLUP_SCHEMA_VERSION};
 use token_fire::core::usage_series::{WIDGET_USAGE_BUCKET_MINUTES, WIDGET_USAGE_WINDOW_MINUTES};
 use token_fire::core::usage_store::{
-    InsertOutcome, RetentionPolicy, RetentionSkipReason, UsageStore,
+    InsertOutcome, ProfileRollupStatus, RetentionPolicy, RetentionSkipReason, UsageStore,
 };
 
 fn observation(
@@ -350,7 +350,7 @@ fn rollup_row_count(db_path: &Path) -> i64 {
         .unwrap()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RollupRow {
     bucket_start_utc: i64,
     source: String,
@@ -398,6 +398,355 @@ fn rollup_rows(db_path: &Path) -> Vec<RollupRow> {
         })
         .unwrap();
     rows.map(Result::unwrap).collect()
+}
+
+/// 从 tracked raw 行按与 upsert/rebuild 相同的 clamp/CASE 语义聚合 8 个 token 分量 + count。
+/// 顺序：input / billable / output / cached / cache_creation / reasoning / unattributed / total / count。
+fn raw_conservation_totals(db_path: &Path) -> [i64; 9] {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            r#"
+            select
+              coalesce(sum(input_tokens), 0),
+              coalesce(sum(max(input_tokens - cached_input_tokens - cache_creation_input_tokens, 0)), 0),
+              coalesce(sum(output_tokens), 0),
+              coalesce(sum(cached_input_tokens), 0),
+              coalesce(sum(cache_creation_input_tokens), 0),
+              coalesce(sum(reasoning_output_tokens), 0),
+              coalesce(sum(case when input_tokens = 0 and output_tokens = 0 and cached_input_tokens = 0
+                        and cache_creation_input_tokens = 0 and reasoning_output_tokens = 0
+                       then max(total_tokens, 0) else 0 end), 0),
+              coalesce(sum(total_tokens), 0),
+              count(*)
+            from token_observations
+            where tracking_window_id is not null
+            "#,
+            [],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ])
+            },
+        )
+        .unwrap()
+}
+
+/// 与 raw_conservation_totals 对齐的 rollup 侧聚合（预聚合列直接求和），供全局守恒断言比较。
+fn rollup_conservation_totals(db_path: &Path) -> [i64; 9] {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            r#"
+            select
+              coalesce(sum(input_tokens), 0),
+              coalesce(sum(billable_uncached_input_tokens), 0),
+              coalesce(sum(output_tokens), 0),
+              coalesce(sum(cached_input_tokens), 0),
+              coalesce(sum(cache_creation_input_tokens), 0),
+              coalesce(sum(reasoning_output_tokens), 0),
+              coalesce(sum(unattributed_total_tokens), 0),
+              coalesce(sum(total_tokens), 0),
+              coalesce(sum(observation_count), 0)
+            from usage_rollups_15m
+            "#,
+            [],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ])
+            },
+        )
+        .unwrap()
+}
+
+/// 造一批分量丰富的 tracked 观测：既有含全部分量的行，也有 total-only（unattributed）行、
+/// 缺 model（key='' ）行与多桶多来源行，覆盖全局守恒与逐 key 语义。
+fn insert_rebuild_fixture(store: &UsageStore) {
+    let base = Utc.with_ymd_and_hms(2026, 7, 11, 12, 7, 33).unwrap();
+    insert_tracked(
+        store,
+        &cost_observation(
+            "rb-1",
+            Some("model-a"),
+            1_000_000,
+            500_000,
+            250_000,
+            100_000,
+            50_000,
+            1_900_000,
+            base,
+        ),
+    )
+    .unwrap();
+    // 同桶同 key 追加一条 total-only，验证 unattributed 单独累积。
+    insert_tracked(
+        store,
+        &cost_observation(
+            "rb-2",
+            Some("model-a"),
+            0,
+            0,
+            0,
+            0,
+            0,
+            1_000_000,
+            base + chrono::Duration::minutes(3),
+        ),
+    )
+    .unwrap();
+    // 缺 model（key=''）+ 不同来源，落入不同 rollup 行。
+    let mut codex = cost_observation(
+        "rb-3",
+        None,
+        7,
+        3,
+        0,
+        0,
+        0,
+        10,
+        base + chrono::Duration::hours(1),
+    );
+    codex.source = "codex".to_string();
+    insert_tracked(store, &codex).unwrap();
+    // 远期桶，确保多桶。
+    insert_tracked(
+        store,
+        &cost_observation(
+            "rb-4",
+            Some("model-b"),
+            2_000,
+            1_000,
+            0,
+            0,
+            0,
+            3_000,
+            base + chrono::Duration::days(3),
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn profile_rollup_rebuild_status_requires_rebuild_when_state_missing() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let store = UsageStore::open(&db_path).unwrap();
+
+    // 增量双写已建 rollup 行，但 migration 从不写 state/schema_version：启动需 rebuild。
+    insert_rebuild_fixture(&store);
+    assert_eq!(rollup_metadata_value(&db_path, "state"), None);
+
+    assert_eq!(
+        store.profile_rollup_status().unwrap(),
+        ProfileRollupStatus::RebuildRequired {
+            reason: "state_missing"
+        }
+    );
+}
+
+#[test]
+fn profile_rollup_rebuild_status_requires_rebuild_when_state_invalid() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let store = UsageStore::open(&db_path).unwrap();
+    insert_rebuild_fixture(&store);
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "insert into usage_rollup_metadata (key, value) values ('state', 'invalid')",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.profile_rollup_status().unwrap(),
+        ProfileRollupStatus::RebuildRequired {
+            reason: "state_invalid"
+        }
+    );
+}
+
+#[test]
+fn profile_rollup_rebuild_status_requires_rebuild_on_version_mismatch() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_rebuild_fixture(&store);
+    store.rebuild_profile_rollups().unwrap();
+
+    // 人为把 schema_version 改成旧值：即使 state=ready 也必须要求 rebuild。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "update usage_rollup_metadata set value = '0' where key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.profile_rollup_status().unwrap(),
+        ProfileRollupStatus::RebuildRequired {
+            reason: "version_mismatch"
+        }
+    );
+}
+
+#[test]
+fn profile_rollup_rebuild_status_requires_rebuild_on_checksum_mismatch() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_rebuild_fixture(&store);
+    store.rebuild_profile_rollups().unwrap();
+    assert!(matches!(
+        store.profile_rollup_status().unwrap(),
+        ProfileRollupStatus::Ready { .. }
+    ));
+
+    // 篡改一行 rollup total，使全局守恒 checksum 与 raw 不一致（state/version 仍 ready）。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "update usage_rollups_15m set total_tokens = total_tokens + 1 where rowid = (select min(rowid) from usage_rollups_15m)",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.profile_rollup_status().unwrap(),
+        ProfileRollupStatus::RebuildRequired {
+            reason: "checksum_mismatch"
+        }
+    );
+}
+
+#[test]
+fn profile_rollup_rebuild_recomputes_all_token_components_from_raw() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_rebuild_fixture(&store);
+
+    let outcome = store.rebuild_profile_rollups().unwrap();
+    assert!(outcome.rebuilt);
+    assert_eq!(outcome.schema_version, PROFILE_ROLLUP_SCHEMA_VERSION);
+    assert_eq!(outcome.rollup_row_count as i64, rollup_row_count(&db_path));
+
+    // rebuild 后所有 8 个 token 分量 + unattributed + count 的全局总和都等于 raw。
+    assert_eq!(
+        rollup_conservation_totals(&db_path),
+        raw_conservation_totals(&db_path)
+    );
+    // rebuild 翻转到 ready + 当前 schema_version。
+    assert_eq!(
+        rollup_metadata_value(&db_path, "state"),
+        Some("ready".to_string())
+    );
+    assert_eq!(
+        rollup_metadata_value(&db_path, "schema_version"),
+        Some(PROFILE_ROLLUP_SCHEMA_VERSION.to_string())
+    );
+    assert!(matches!(
+        store.profile_rollup_status().unwrap(),
+        ProfileRollupStatus::Ready { .. }
+    ));
+}
+
+#[test]
+fn profile_rollup_rebuild_shadow_failure_keeps_old_rollup_and_version() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_rebuild_fixture(&store);
+    store.rebuild_profile_rollups().unwrap();
+
+    // 记录旧完整状态：行内容 + 全局校验 + schema_version。
+    let old_rows = rollup_rows(&db_path);
+    let old_totals = rollup_conservation_totals(&db_path);
+    assert!(!old_rows.is_empty());
+
+    // 用同名 index 占用 shadow 表名：drop table if exists 不清理 index，
+    // 后续 create table usage_rollups_15m_rebuild 必失败 → rebuild body 事务回滚。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "create index usage_rollups_15m_rebuild on usage_rollups_15m(source)",
+            [],
+        )
+        .unwrap();
+
+    let err = store.rebuild_profile_rollups();
+    assert!(err.is_err(), "shadow create 冲突应使 rebuild 失败");
+
+    // 旧表仍可查询且内容不变（原子性：只可能是完整旧状态）。
+    assert_eq!(rollup_rows(&db_path), old_rows);
+    assert_eq!(rollup_conservation_totals(&db_path), old_totals);
+    // 旧 version 不变；state 不是 ready（失败后停留 invalid）。
+    assert_eq!(
+        rollup_metadata_value(&db_path, "schema_version"),
+        Some(PROFILE_ROLLUP_SCHEMA_VERSION.to_string())
+    );
+    assert_ne!(
+        rollup_metadata_value(&db_path, "state"),
+        Some("ready".to_string())
+    );
+}
+
+#[test]
+fn profile_rollup_ensure_ready_validates_once_and_does_not_rebuild_again() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_rebuild_fixture(&store);
+
+    // 首次：state 缺失 → RebuildRequired → 真正 rebuild。
+    let first = store.ensure_profile_rollup_ready().unwrap();
+    assert!(first.rebuilt);
+    assert_eq!(first.schema_version, PROFILE_ROLLUP_SCHEMA_VERSION);
+
+    // 第二次：已 Ready → 不再 rebuild，直接返回 rebuilt:false。
+    let second = store.ensure_profile_rollup_ready().unwrap();
+    assert!(!second.rebuilt);
+    assert_eq!(second.rollup_row_count, first.rollup_row_count);
+    assert_eq!(second.schema_version, PROFILE_ROLLUP_SCHEMA_VERSION);
+}
+
+#[test]
+fn profile_rollup_rebuild_bucket_matches_rust_single_write_bucket() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+
+    // 非 15 分钟对齐时间：验证 DB 侧 unixepoch()/900*900 与 Rust div_euclid 落入同一桶。
+    let observed_at = Utc.with_ymd_and_hms(2026, 7, 11, 12, 14, 59).unwrap();
+    insert_tracked(&store, &observation("bucket-parity", 100, observed_at)).unwrap();
+
+    // 增量单条写入用 Rust bucket_start_utc。
+    let rust_bucket = rollup_rows(&db_path)[0].bucket_start_utc;
+    assert_eq!(rust_bucket, bucket_start_utc(observed_at));
+
+    // 全量 rebuild 用 SQL unixepoch()/900*900 重算 bucket，必须与 Rust 相同。
+    store.rebuild_profile_rollups().unwrap();
+    let rebuilt = rollup_rows(&db_path);
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].bucket_start_utc, rust_bucket);
 }
 
 #[test]
