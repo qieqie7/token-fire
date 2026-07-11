@@ -153,12 +153,16 @@ describe("profile summary controller", () => {
     expect(onLoading).toHaveBeenLastCalledWith(false);
   });
 
-  it("keeps the shell renderable when loading fails", async () => {
+  it("keeps the last successful summary when a later load fails", async () => {
     const onSummary = vi.fn();
     const onLoading = vi.fn();
     const onError = vi.fn();
+    const load = vi
+      .fn()
+      .mockResolvedValueOnce(summary)
+      .mockRejectedValueOnce(new Error("profile failed"));
     const controller = createProfileSummaryController({
-      load: vi.fn().mockRejectedValue(new Error("profile failed")),
+      load,
       onSummary,
       onLoading,
       onError,
@@ -168,12 +172,66 @@ describe("profile summary controller", () => {
       clearInterval: () => {},
     });
 
-    controller.start("today");
+    controller.start("this_week");
+    await flushProfileRefresh();
+    // 首次成功后切换 period，第二次 load reject。
+    controller.refresh("today");
     await flushProfileRefresh();
 
-    expect(onSummary).toHaveBeenCalledWith(null);
-    expect(onError).toHaveBeenCalledWith(true);
-    expect(onLoading).toHaveBeenLastCalledWith(false);
+    // onSummary 只在首次成功时被调用一次，失败分支不清空为 null。
+    expect(onSummary).toHaveBeenCalledTimes(1);
+    expect(onSummary).toHaveBeenCalledWith(summary);
+    expect(onSummary).not.toHaveBeenCalledWith(null);
+    expect(onError).toHaveBeenLastCalledWith(true);
+    // loading 顺序：首次 true,false，切换后 true,false。
+    expect(onLoading.mock.calls.map((call) => call[0])).toEqual([true, false, true, false]);
+  });
+
+  it("ignores a stale response that resolves after a newer request", async () => {
+    let resolveFirst: ((value: ProfileSummary) => void) | undefined;
+    const secondSummary: ProfileSummary = {
+      ...summary,
+      selected_period: { ...summary.selected_period, estimated_cost: 999 },
+    };
+    const onSummary = vi.fn();
+    const onLoading = vi.fn();
+    const onError = vi.fn();
+    const load = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<ProfileSummary>((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(secondSummary);
+    const controller = createProfileSummaryController({
+      load,
+      onSummary,
+      onLoading,
+      onError,
+      subscribe: vi.fn().mockResolvedValue(() => {}),
+      fallbackIntervalMs: 300_000,
+      setInterval: () => 0,
+      clearInterval: () => {},
+    });
+
+    controller.start("this_week"); // 请求 1（挂起）
+    controller.refresh("today"); // 请求 2（最新）
+    await flushProfileRefresh();
+    // 请求 2 先返回。
+    expect(onSummary).toHaveBeenCalledTimes(1);
+    expect(onSummary).toHaveBeenCalledWith(secondSummary);
+    onError.mockClear();
+    onLoading.mockClear();
+
+    // 请求 1 晚于请求 2 resolve：应被丢弃，不覆盖 summary，不清除 loading/error。
+    resolveFirst?.(summary);
+    await flushProfileRefresh();
+    expect(onSummary).toHaveBeenCalledTimes(1);
+    expect(onSummary).not.toHaveBeenCalledWith(summary);
+    expect(onLoading).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it("ignores load resolution after stop", async () => {
