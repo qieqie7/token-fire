@@ -21,7 +21,10 @@ use token_fire::app::runtime::{
     handle_runtime_event_with_logger, start_app_runtime_for_state, token_fire_hook_path_from_exe,
     AppRuntime, RuntimeEvent,
 };
-use token_fire::app::source_ingest::{SourceEmptyReason, SourceIngestPaths, SourceIngestRouter};
+use token_fire::app::source_ingest::{
+    SourceEmptyReason, SourceIngestEvent, SourceIngestPaths, SourceIngestRouter, SourceResolution,
+};
+use token_fire::app::source_signals::RecentSourceSignals;
 use token_fire::app::state::AppState;
 use token_fire::app::tracking::TrackingGate;
 use token_fire::app::usage_invalidation::notify_usage_facts_invalidated;
@@ -483,6 +486,103 @@ fn runtime_does_not_emit_usage_facts_invalidated_for_duplicate_only_ingest() {
 
     assert_eq!(duplicate_report.inserted, 0);
     assert!(emitted.lock().unwrap().is_empty());
+}
+
+#[test]
+fn runtime_records_recent_source_signal_snapshot_for_cursor_empty_collect() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path());
+    let transcript_path = dir.path().join("cursor-empty-runtime.jsonl");
+    fs::write(&transcript_path, "{}").unwrap();
+    let store = UsageStore::open(&paths.database).unwrap();
+    store
+        .open_tracking_window(Utc.with_ymd_and_hms(2026, 7, 10, 9, 0, 0).unwrap())
+        .unwrap();
+    let scheduler = IngestScheduler::new(store);
+    let registry = SourceRegistry::new(vec![]);
+    let tracking_gate = TrackingGate::new();
+    tracking_gate.resume();
+    let logger = RuntimeLogger::new(paths.clone(), DebugLogGate::default());
+    let widget_events = WidgetEventEmitter::noop();
+    let signals = RecentSourceSignals::default();
+
+    let result =
+        token_fire::app::runtime::handle_runtime_event_with_logger_widget_events_and_signals(
+            RuntimeEvent::Hook {
+                source: TokenSourceKind::Cursor,
+                metadata: HookMetadata {
+                    source: Some("cursor".to_string()),
+                    hook_event_name: Some("stop".to_string()),
+                    transcript_path: Some(transcript_path.to_string_lossy().to_string()),
+                    timestamp: Some("2026-07-10T10:00:00Z".to_string()),
+                    ..HookMetadata::default()
+                },
+            },
+            &registry,
+            &scheduler,
+            &tracking_gate,
+            &logger,
+            &widget_events,
+            &signals,
+        )
+        .unwrap();
+
+    assert_eq!(result, None);
+    let latest = signals.latest(TokenSourceKind::Cursor).unwrap();
+    assert_eq!(latest.source, TokenSourceKind::Cursor);
+    assert_eq!(latest.event, SourceIngestEvent::Hook);
+    assert_eq!(latest.resolution, SourceResolution::TranscriptPath);
+    assert_eq!(latest.inserted, None);
+    assert!(latest.empty_reason.is_some());
+}
+
+#[test]
+fn runtime_records_recent_source_signal_snapshot_for_cursor_parse_failure() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path());
+    let transcript_path = dir.path().join("cursor-failed-runtime.jsonl");
+    fs::write(&transcript_path, "not-json\n").unwrap();
+    let store = UsageStore::open(&paths.database).unwrap();
+    store
+        .open_tracking_window(Utc.with_ymd_and_hms(2026, 7, 10, 9, 0, 0).unwrap())
+        .unwrap();
+    let scheduler = IngestScheduler::new(store);
+    let registry = SourceRegistry::new(vec![]);
+    let tracking_gate = TrackingGate::new();
+    tracking_gate.resume();
+    let logger = RuntimeLogger::new(paths.clone(), DebugLogGate::default());
+    let widget_events = WidgetEventEmitter::noop();
+    let signals = RecentSourceSignals::default();
+
+    let error =
+        token_fire::app::runtime::handle_runtime_event_with_logger_widget_events_and_signals(
+            RuntimeEvent::Hook {
+                source: TokenSourceKind::Cursor,
+                metadata: HookMetadata {
+                    source: Some("cursor".to_string()),
+                    hook_event_name: Some("stop".to_string()),
+                    transcript_path: Some(transcript_path.to_string_lossy().to_string()),
+                    timestamp: Some("2026-07-10T10:00:00Z".to_string()),
+                    ..HookMetadata::default()
+                },
+            },
+            &registry,
+            &scheduler,
+            &tracking_gate,
+            &logger,
+            &widget_events,
+            &signals,
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("failed"));
+    let latest = signals.latest(TokenSourceKind::Cursor).unwrap();
+    assert_eq!(latest.source, TokenSourceKind::Cursor);
+    assert_eq!(latest.event, SourceIngestEvent::Hook);
+    assert_eq!(
+        latest.error_kind.as_deref(),
+        Some("transcript_parse_failed")
+    );
 }
 
 #[test]

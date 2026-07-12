@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
+use tauri::AppHandle;
 use tauri::Manager;
 use tauri::State;
 use token_fire::adapters::codex::hook_config::CodexHookConfigManager;
@@ -21,9 +22,15 @@ use token_fire::app::release_check::{
     GithubReleaseHttpClient, ReleaseCheckStore, ReleaseUpdateStateStore, ReleaseUpdateStatus,
 };
 use token_fire::app::runtime::start_app_runtime_for_state_with_widget_events;
+use token_fire::app::source_diagnostics::{
+    handle_diagnostic_menu_action, SourceDiagnosticsSnapshot,
+};
 use token_fire::app::state::AppState;
 use token_fire::app::tracking::TrackingGate;
-use token_fire::app::tray::{install_tray, refresh_tray_title_from_app, start_tray_refresh_loop};
+use token_fire::app::tray::{
+    handle_menu_action_outcome, install_tray, refresh_tray_title_from_app, show_profile_window,
+    start_tray_refresh_loop,
+};
 use token_fire::app::usage_invalidation::notify_usage_facts_invalidated;
 use token_fire::app::widget_events::{emit_usage_fact_invalidation_events, WidgetEventEmitter};
 use token_fire::core::profile::{ProfilePeriod, ProfileSummary};
@@ -59,6 +66,29 @@ fn release_update_status(state: State<'_, ReleaseUpdateStateStore>) -> ReleaseUp
 fn open_latest_release(state: State<'_, ReleaseUpdateStateStore>) -> Result<(), String> {
     let url = trusted_release_url_for_status(&state.get());
     open_release_url(&url).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn source_diagnostics_snapshot(
+    state: State<'_, AppState>,
+) -> Result<SourceDiagnosticsSnapshot, String> {
+    state
+        .source_diagnostics_snapshot_at(chrono::Utc::now())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn source_diagnostics_action(
+    action_id: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    handle_diagnostic_menu_action(
+        &action_id,
+        |action| state.handle_menu_action(action),
+        |outcome| handle_menu_action_outcome(&app, outcome),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn main() {
@@ -116,14 +146,16 @@ fn main() {
     );
     let release_build_identity = build_identity_value.clone();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(app_state)
         .manage(release_update_state.clone())
         .invoke_handler(tauri::generate_handler![
             profile_summary,
             build_identity,
             release_update_status,
-            open_latest_release
+            open_latest_release,
+            source_diagnostics_snapshot,
+            source_diagnostics_action
         ])
         .setup(move |app| {
             install_tray(app.handle())?;
@@ -159,12 +191,21 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() == "main" {
+            if matches!(window.label(), "main" | "source-diagnostics") {
                 if let tauri::WindowEvent::Focused(false) = event {
                     let _ = window.hide();
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run TokenFire");
+        .build(tauri::generate_context!())
+        .expect("failed to build TokenFire");
+
+    app.run(|app_handle, event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = event {
+            if let Err(error) = show_profile_window(app_handle) {
+                eprintln!("failed to show profile window on dock reopen: {error:#}");
+            }
+        }
+    });
 }

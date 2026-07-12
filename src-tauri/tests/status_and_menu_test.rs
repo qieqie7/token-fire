@@ -16,11 +16,70 @@ use token_fire::app::debug_bundle::debug_bundle_sources_summary;
 use token_fire::app::logging::write_jsonl_event;
 use token_fire::app::menu::menu_labels;
 use token_fire::app::paths::RuntimePaths;
-use token_fire::app::state::AppState;
+use token_fire::app::source_diagnostics::{
+    headline_for_chain, primary_break_for_chain, DiagnosticHeadline, DiagnosticStage,
+    DiagnosticStageKey, DiagnosticStatus, SourceDiagnostic,
+};
+use token_fire::app::source_ingest::{SourceEmptyReason, SourceIngestEvent, SourceResolution};
+use token_fire::app::source_signals::SourceSignalRecord;
+use token_fire::app::state::{AppState, MenuAction, MenuActionOutcome};
 use token_fire::app::status::{status_label, ui_status, ui_status_from_sources, UiStatus};
 use token_fire::core::observation::{NormalizedObservation, SourceRecordIdConfidence};
 use token_fire::core::pricing::PricingStatus;
 use token_fire::core::usage_store::UsageStore;
+
+fn diagnostic_stage(key: DiagnosticStageKey, status: DiagnosticStatus) -> DiagnosticStage {
+    DiagnosticStage {
+        key,
+        label: key.label().to_string(),
+        status,
+        summary: status.summary_label().to_string(),
+        evidence: None,
+        checked_at: None,
+    }
+}
+
+fn diagnostic_evidence_value<'a>(
+    source: &'a SourceDiagnostic,
+    group_title: &str,
+    label: &str,
+) -> Option<&'a str> {
+    source
+        .evidence
+        .iter()
+        .find(|group| group.title == group_title)
+        .and_then(|group| group.items.iter().find(|item| item.label == label))
+        .map(|item| item.value.as_str())
+}
+
+#[test]
+fn diagnostics_headline_comes_from_first_meaningful_break() {
+    let chain = vec![
+        diagnostic_stage(DiagnosticStageKey::Participation, DiagnosticStatus::Ok),
+        diagnostic_stage(DiagnosticStageKey::Capture, DiagnosticStatus::Ok),
+        diagnostic_stage(DiagnosticStageKey::Signal, DiagnosticStatus::Ok),
+        diagnostic_stage(DiagnosticStageKey::Extraction, DiagnosticStatus::Warning),
+        diagnostic_stage(DiagnosticStageKey::Storage, DiagnosticStatus::Unknown),
+    ];
+
+    assert_eq!(
+        headline_for_chain(&chain),
+        DiagnosticHeadline::TokenNotExtracted
+    );
+    let primary_break = primary_break_for_chain(&chain).unwrap();
+    assert_eq!(primary_break.stage, DiagnosticStageKey::Extraction);
+    assert_eq!(primary_break.title, "未提取到 token");
+}
+
+#[test]
+fn diagnostics_contract_serializes_snake_case_for_frontend() {
+    let stage = diagnostic_stage(DiagnosticStageKey::Storage, DiagnosticStatus::NotApplicable);
+    let value = serde_json::to_value(stage).unwrap();
+
+    assert_eq!(value["key"], "storage");
+    assert_eq!(value["label"], "写入统计");
+    assert_eq!(value["status"], "not_applicable");
+}
 
 #[test]
 fn token_source_kind_has_menu_order_and_display_names() {
@@ -224,6 +283,96 @@ fn menu_labels_are_chinese_with_source_submenu() {
     assert_eq!(labels.copy_debug_bundle, "复制诊断包");
     assert_eq!(labels.enable_debug_logging, "开启调试日志");
     assert_eq!(labels.quit, "退出");
+}
+
+#[test]
+fn menu_labels_include_source_diagnostics_entry() {
+    let labels = menu_labels();
+
+    assert_eq!(labels.source_diagnostics, "接入诊断...");
+}
+
+#[test]
+fn menu_action_from_id_maps_source_diagnostics() {
+    assert_eq!(
+        token_fire::app::tray::menu_action_from_id("open_source_diagnostics"),
+        Some(token_fire::app::state::MenuAction::OpenSourceDiagnostics)
+    );
+}
+
+#[test]
+fn source_diagnostics_action_maps_only_safe_actions() {
+    assert_eq!(
+        token_fire::app::source_diagnostics::menu_action_for_diagnostic_action("open_logs"),
+        Some(MenuAction::OpenLogs)
+    );
+    assert_eq!(
+        token_fire::app::source_diagnostics::menu_action_for_diagnostic_action("copy_debug_bundle"),
+        Some(MenuAction::CopyDebugBundle)
+    );
+    assert_eq!(
+        token_fire::app::source_diagnostics::menu_action_for_diagnostic_action("refresh"),
+        None
+    );
+    assert_eq!(
+        token_fire::app::source_diagnostics::menu_action_for_diagnostic_action("reinstall_hook"),
+        None
+    );
+}
+
+#[test]
+fn source_diagnostics_action_passes_native_outcomes_to_handler() {
+    let cases = [
+        (
+            "open_logs",
+            MenuAction::OpenLogs,
+            MenuActionOutcome::LogsDirectoryRequested(PathBuf::from("/tmp/token-fire-logs")),
+        ),
+        (
+            "copy_debug_bundle",
+            MenuAction::CopyDebugBundle,
+            MenuActionOutcome::DebugBundleCreated(PathBuf::from("/tmp/token-fire-debug.zip")),
+        ),
+    ];
+
+    for (action_id, expected_action, expected_outcome) in cases {
+        let mut received = None;
+
+        token_fire::app::source_diagnostics::handle_diagnostic_menu_action(
+            action_id,
+            |action| {
+                assert_eq!(action, expected_action);
+                Ok(expected_outcome.clone())
+            },
+            |outcome| {
+                received = Some(outcome);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(received, Some(expected_outcome));
+    }
+}
+
+#[test]
+fn tray_menu_contains_source_diagnostics_before_logs_actions() {
+    let labels = menu_labels();
+    let html_order = [
+        labels.source_diagnostics,
+        labels.open_logs,
+        labels.copy_debug_bundle,
+    ];
+
+    assert_eq!(html_order[0], "接入诊断...");
+}
+
+#[test]
+fn source_diagnostics_window_focused_event_contract() {
+    assert_eq!(
+        token_fire::app::tray::SOURCE_DIAGNOSTICS_WINDOW_FOCUSED_EVENT,
+        "source_diagnostics_window_focused"
+    );
 }
 
 #[test]
@@ -487,6 +636,1449 @@ fn enabled_codex_unreadable_is_yellow_not_red() {
 fn profile_source_labels_include_cursor() {
     assert_eq!(token_fire::core::profile::source_label("claude"), "Claude");
     assert_eq!(token_fire::core::profile::source_label("cursor"), "Cursor");
+}
+
+#[test]
+fn source_diagnostics_marks_optional_disabled_sources_neutral() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let managers = token_fire::app::state::SourceHookManagers::new(
+        HookConfigManager::new(dir.path().join("traecli.toml"), paths.backups_dir.clone()),
+        CodexHookConfigManager::new(
+            dir.path().join("codex-hooks.json"),
+            paths.backups_dir.clone(),
+        ),
+        ClaudeHookConfigManager::new(
+            dir.path().join("claude-settings.json"),
+            paths.backups_dir.clone(),
+        ),
+        CursorHookConfigManager::new(
+            dir.path().join("cursor-hooks.json"),
+            paths.backups_dir.clone(),
+        ),
+    );
+    let app_state = AppState::new_with_source_hook_managers(paths, managers);
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap())
+        .unwrap();
+    let claude = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Claude)
+        .unwrap();
+
+    assert_eq!(claude.headline, DiagnosticHeadline::Disabled);
+    assert!(claude.optional);
+    assert_eq!(snapshot.summary.disabled, 2);
+}
+
+#[test]
+fn source_diagnostics_marks_cursor_empty_collect_as_token_not_extracted() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let app_state = AppState::new(paths);
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Cursor,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap(),
+            inserted: Some(0),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: Some(SourceEmptyReason::NoNewCompleteRound),
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(Utc.with_ymd_and_hms(2026, 7, 10, 10, 1, 0).unwrap())
+        .unwrap();
+    let cursor = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Cursor)
+        .unwrap();
+
+    assert_eq!(cursor.headline, DiagnosticHeadline::TokenNotExtracted);
+    assert_eq!(
+        cursor.primary_break.as_ref().unwrap().stage,
+        DiagnosticStageKey::Extraction
+    );
+    assert!(cursor.chain.iter().any(|stage| {
+        stage.key == DiagnosticStageKey::Signal && stage.status == DiagnosticStatus::Ok
+    }));
+    assert!(cursor.chain.iter().any(|stage| {
+        stage.key == DiagnosticStageKey::Extraction && stage.status == DiagnosticStatus::Warning
+    }));
+}
+
+#[test]
+fn source_diagnostics_marks_failed_signal_as_not_connected() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let app_state = AppState::new(paths);
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Cursor,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::None,
+            seen_at: Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap(),
+            inserted: None,
+            duplicates: None,
+            skipped_outside_tracking: None,
+            empty_reason: None,
+            error_kind: Some("source_adapter_failed".to_string()),
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(Utc.with_ymd_and_hms(2026, 7, 10, 10, 1, 0).unwrap())
+        .unwrap();
+    let cursor = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Cursor)
+        .unwrap();
+
+    assert!(matches!(
+        cursor.headline,
+        DiagnosticHeadline::TokenNotExtracted | DiagnosticHeadline::RuntimeError
+    ));
+    assert!(cursor.primary_break.is_some());
+    assert!(cursor.chain.iter().any(|stage| {
+        matches!(
+            stage.key,
+            DiagnosticStageKey::Extraction | DiagnosticStageKey::Storage
+        ) && matches!(
+            stage.status,
+            DiagnosticStatus::Error | DiagnosticStatus::Warning
+        )
+    }));
+}
+
+#[test]
+fn source_diagnostics_marks_zero_write_signal_as_not_connected() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let app_state = AppState::new(paths);
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Cursor,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap(),
+            inserted: Some(0),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(Utc.with_ymd_and_hms(2026, 7, 10, 10, 1, 0).unwrap())
+        .unwrap();
+    let cursor = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Cursor)
+        .unwrap();
+
+    assert_ne!(cursor.headline, DiagnosticHeadline::Connected);
+    assert!(cursor.primary_break.is_some());
+    assert!(cursor.chain.iter().any(|stage| {
+        matches!(
+            stage.key,
+            DiagnosticStageKey::Extraction | DiagnosticStageKey::Storage
+        ) && matches!(
+            stage.status,
+            DiagnosticStatus::Warning | DiagnosticStatus::Unknown
+        )
+    }));
+}
+
+#[test]
+fn source_diagnostics_keeps_success_trusted_after_signal_freshness_expires() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let app_state = AppState::new(paths);
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Traex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: Utc.with_ymd_and_hms(2026, 7, 10, 9, 0, 0).unwrap(),
+            inserted: Some(3),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap())
+        .unwrap();
+    let traex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Traex)
+        .unwrap();
+    let signal = traex
+        .chain
+        .iter()
+        .find(|stage| stage.key == DiagnosticStageKey::Signal)
+        .unwrap();
+    let storage = traex
+        .chain
+        .iter()
+        .find(|stage| stage.key == DiagnosticStageKey::Storage)
+        .unwrap();
+
+    assert_eq!(traex.headline, DiagnosticHeadline::Connected);
+    assert_eq!(signal.status, DiagnosticStatus::Ok);
+    assert_eq!(storage.status, DiagnosticStatus::Ok);
+    assert!(diagnostic_evidence_value(traex, "最近采集", "最近捕获").is_some());
+    assert_eq!(
+        diagnostic_evidence_value(traex, "数据库证据", "可信状态"),
+        Some("可信")
+    );
+}
+
+#[test]
+fn source_diagnostics_keeps_optional_source_enabled_after_success_signal_expires() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let managers = token_fire::app::state::SourceHookManagers::new(
+        HookConfigManager::new(dir.path().join("traecli.toml"), paths.backups_dir.clone()),
+        CodexHookConfigManager::new(
+            dir.path().join("codex-hooks.json"),
+            paths.backups_dir.clone(),
+        ),
+        ClaudeHookConfigManager::new(
+            dir.path().join("claude-settings.json"),
+            paths.backups_dir.clone(),
+        ),
+        CursorHookConfigManager::new(
+            dir.path().join("cursor-hooks.json"),
+            paths.backups_dir.clone(),
+        ),
+    );
+    let app_state = AppState::new_with_source_hook_managers(paths, managers);
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Cursor,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: Utc.with_ymd_and_hms(2026, 7, 10, 9, 0, 0).unwrap(),
+            inserted: Some(5),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap())
+        .unwrap();
+    let cursor = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Cursor)
+        .unwrap();
+
+    assert_eq!(cursor.headline, DiagnosticHeadline::Connected);
+    assert!(cursor
+        .chain
+        .iter()
+        .all(|stage| stage.status == DiagnosticStatus::Ok));
+    assert_eq!(
+        diagnostic_evidence_value(cursor, "数据库证据", "可信状态"),
+        Some("可信")
+    );
+}
+
+#[test]
+fn source_diagnostics_does_not_use_old_storage_to_prove_new_empty_signal() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let store = UsageStore::open(&paths.database).unwrap();
+    let old_observed_at = Utc.with_ymd_and_hms(2026, 7, 9, 9, 0, 0).unwrap();
+    let old_row = normalized_observation(
+        "old-cursor-row",
+        "cursor",
+        Some("cursor-model"),
+        100,
+        old_observed_at,
+    );
+    let window_id = store
+        .open_tracking_window(old_observed_at - chrono::Duration::minutes(1))
+        .unwrap();
+    store
+        .insert_observation_for_tracking_window(&old_row, window_id)
+        .unwrap();
+
+    let app_state = AppState::new(paths);
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Cursor,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap(),
+            inserted: Some(0),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: Some(SourceEmptyReason::NoNewCompleteRound),
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(Utc.with_ymd_and_hms(2026, 7, 10, 10, 1, 0).unwrap())
+        .unwrap();
+    let cursor = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Cursor)
+        .unwrap();
+    let storage = cursor
+        .chain
+        .iter()
+        .find(|stage| stage.key == DiagnosticStageKey::Storage)
+        .unwrap();
+
+    assert_ne!(storage.status, DiagnosticStatus::Ok);
+}
+
+#[test]
+fn source_diagnostics_keeps_recent_success_when_followed_by_noop_signal() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let store = UsageStore::open(&paths.database).unwrap();
+    let observed_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    let row = normalized_observation(
+        "codex-success-row",
+        "codex",
+        Some("codex-model"),
+        100,
+        observed_at,
+    );
+    let window_id = store
+        .open_tracking_window(observed_at - chrono::Duration::minutes(1))
+        .unwrap();
+    store
+        .insert_observation_for_tracking_window(&row, window_id)
+        .unwrap();
+
+    let app_state = AppState::new(paths);
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: observed_at,
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: observed_at + chrono::Duration::minutes(2),
+            inserted: Some(0),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: Some(SourceEmptyReason::NoNewCompleteRound),
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(observed_at + chrono::Duration::minutes(3))
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_eq!(codex.headline, DiagnosticHeadline::Connected);
+    assert!(codex.primary_break.is_none());
+    assert!(codex.chain.iter().any(|stage| {
+        stage.key == DiagnosticStageKey::Storage && stage.status == DiagnosticStatus::Ok
+    }));
+    assert!(diagnostic_evidence_value(codex, "数据库证据", "数据库最近写入").is_some());
+}
+
+#[test]
+fn source_diagnostics_shows_latest_noop_without_losing_recent_success() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let store = UsageStore::open(&paths.database).unwrap();
+    let observed_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    let row = normalized_observation(
+        "codex-success-row",
+        "codex",
+        Some("codex-model"),
+        100,
+        observed_at,
+    );
+    let window_id = store
+        .open_tracking_window(observed_at - chrono::Duration::minutes(1))
+        .unwrap();
+    store
+        .insert_observation_for_tracking_window(&row, window_id)
+        .unwrap();
+
+    let app_state = AppState::new(paths);
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: observed_at,
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: observed_at + chrono::Duration::minutes(2),
+            inserted: Some(0),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: Some(SourceEmptyReason::NoNewCompleteRound),
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(observed_at + chrono::Duration::minutes(3))
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_eq!(codex.headline, DiagnosticHeadline::Connected);
+    assert!(codex.trust_summary.contains("最新检查无新增"));
+    assert_eq!(
+        diagnostic_evidence_value(codex, "最近采集", "检查结果"),
+        Some("无新增完整轮次")
+    );
+    assert_eq!(
+        codex.display_summary.note_text.as_deref(),
+        Some("最新检查无新增完整轮次")
+    );
+    assert_eq!(
+        diagnostic_evidence_value(codex, "数据库证据", "可信状态"),
+        Some("可信")
+    );
+}
+
+#[test]
+fn source_diagnostics_exposes_user_semantic_evidence_contract() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let app_state = AppState::new(paths);
+    let captured_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: captured_at,
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(895),
+            empty_reason: None,
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(captured_at + chrono::Duration::minutes(3))
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_eq!(codex.display_summary.status_text, "已接入");
+    assert!(codex
+        .display_summary
+        .detail_text
+        .contains("最近成功写入 1 条"));
+    assert!(codex
+        .display_summary
+        .note_text
+        .as_deref()
+        .is_some_and(|note| note.contains("895 条窗口外历史记录")));
+    assert_eq!(
+        codex
+            .evidence
+            .iter()
+            .map(|group| group.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["当前判断", "接入状态", "最近采集", "数据库证据", "最新问题"]
+    );
+    let expected_capture_time = captured_at
+        .with_timezone(&Local)
+        .format("%H:%M")
+        .to_string();
+    assert_eq!(
+        diagnostic_evidence_value(codex, "最近采集", "最近捕获"),
+        Some(expected_capture_time.as_str())
+    );
+    assert_eq!(
+        diagnostic_evidence_value(codex, "最近采集", "本次写入"),
+        Some("1 条")
+    );
+    assert_eq!(
+        diagnostic_evidence_value(codex, "最近采集", "重复记录"),
+        Some("0 条")
+    );
+    assert_eq!(
+        diagnostic_evidence_value(codex, "最近采集", "窗口外记录"),
+        Some("895 条")
+    );
+    assert_eq!(
+        diagnostic_evidence_value(codex, "数据库证据", "可信状态"),
+        Some("可信")
+    );
+    assert_eq!(
+        diagnostic_evidence_value(codex, "最新问题", "最新问题"),
+        Some("无")
+    );
+
+    let serialized = serde_json::to_string(codex).unwrap();
+    for raw_key in [
+        "latest_signal_at",
+        "last_signal_at",
+        "latest_signal_result",
+        "latest_success_trust",
+        "latest_storage_by_source",
+        "latest_hard_failure_reason",
+    ] {
+        assert!(
+            !serialized.contains(raw_key),
+            "raw evidence key leaked: {raw_key}"
+        );
+    }
+}
+
+#[test]
+fn source_diagnostics_keeps_recent_success_after_outside_window_only_signal() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let app_state = AppState::new(paths);
+    let success_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: success_at,
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: success_at + chrono::Duration::minutes(2),
+            inserted: Some(0),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(895),
+            empty_reason: Some(SourceEmptyReason::OutsideTrackingWindow),
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(success_at + chrono::Duration::minutes(3))
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_eq!(codex.headline, DiagnosticHeadline::Connected);
+    assert_eq!(
+        diagnostic_evidence_value(codex, "最近采集", "窗口外记录"),
+        Some("895 条")
+    );
+    assert_eq!(
+        diagnostic_evidence_value(codex, "最新问题", "最新问题"),
+        Some("无")
+    );
+    assert!(codex
+        .display_summary
+        .note_text
+        .as_deref()
+        .is_some_and(|note| note.contains("895 条窗口外历史记录")));
+}
+
+#[test]
+fn source_diagnostics_does_not_treat_outside_window_only_as_runtime_error() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let app_state = AppState::new(paths);
+    let seen_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at,
+            inserted: Some(0),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(895),
+            empty_reason: Some(SourceEmptyReason::OutsideTrackingWindow),
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(seen_at + chrono::Duration::minutes(1))
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_ne!(codex.headline, DiagnosticHeadline::RuntimeError);
+    assert_eq!(
+        diagnostic_evidence_value(codex, "数据库证据", "可信状态"),
+        Some("缺少")
+    );
+    assert_eq!(
+        diagnostic_evidence_value(codex, "最新问题", "最新问题"),
+        Some("无")
+    );
+}
+
+#[test]
+fn source_diagnostics_trusts_single_runtime_success_for_six_hours() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let app_state = AppState::new(paths);
+    let success_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: success_at,
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(success_at + chrono::Duration::minutes(30))
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_eq!(codex.headline, DiagnosticHeadline::Connected);
+    assert_eq!(
+        diagnostic_evidence_value(codex, "数据库证据", "可信状态"),
+        Some("可信")
+    );
+}
+
+#[test]
+fn source_diagnostics_expires_success_after_six_hours() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let app_state = AppState::new(paths);
+    let success_at = Utc.with_ymd_and_hms(2026, 7, 10, 4, 40, 0).unwrap();
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: success_at,
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: success_at + chrono::Duration::minutes(3),
+            inserted: Some(0),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: Some(SourceEmptyReason::NoNewCompleteRound),
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(success_at + chrono::Duration::hours(7))
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_eq!(codex.headline, DiagnosticHeadline::PendingVerification);
+    assert!(codex.trust_summary.contains("最近成功已过期"));
+    assert_eq!(
+        diagnostic_evidence_value(codex, "数据库证据", "可信状态"),
+        Some("已过期")
+    );
+}
+
+#[test]
+fn source_diagnostics_hard_failure_after_success_overrides_trust() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let app_state = AppState::new(paths);
+    let success_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: success_at,
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::None,
+            seen_at: success_at + chrono::Duration::minutes(2),
+            inserted: None,
+            duplicates: None,
+            skipped_outside_tracking: None,
+            empty_reason: Some(SourceEmptyReason::TranscriptUnreadable),
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(success_at + chrono::Duration::minutes(3))
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_ne!(codex.headline, DiagnosticHeadline::Connected);
+    assert!(codex.trust_summary.contains("最新问题"));
+    assert_eq!(
+        diagnostic_evidence_value(codex, "最新问题", "最新问题"),
+        Some("transcript 不可读")
+    );
+}
+
+#[test]
+fn source_diagnostics_success_after_hard_failure_restores_trust() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let app_state = AppState::new(paths);
+    let failure_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::None,
+            seen_at: failure_at,
+            inserted: None,
+            duplicates: None,
+            skipped_outside_tracking: None,
+            empty_reason: Some(SourceEmptyReason::TranscriptUnreadable),
+            error_kind: None,
+        });
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: failure_at + chrono::Duration::minutes(5),
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(failure_at + chrono::Duration::minutes(6))
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_eq!(codex.headline, DiagnosticHeadline::Connected);
+    assert!(codex.primary_break.is_none());
+    assert_eq!(
+        diagnostic_evidence_value(codex, "数据库证据", "可信状态"),
+        Some("可信")
+    );
+}
+
+#[test]
+fn source_diagnostics_keeps_trusted_success_when_latest_signal_is_stale_noop() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let app_state = AppState::new(paths);
+    let success_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: success_at,
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: success_at + chrono::Duration::minutes(20),
+            inserted: Some(0),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: Some(SourceEmptyReason::NoNewCompleteRound),
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(success_at + chrono::Duration::minutes(40))
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_eq!(codex.headline, DiagnosticHeadline::Connected);
+    assert!(codex.trust_summary.contains("最近成功"));
+}
+
+#[test]
+fn source_diagnostics_config_error_overrides_recent_success() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let claude_config = dir.path().join("claude-settings.json");
+    fs::write(&claude_config, r#"{"hooks": "#).unwrap();
+    let managers = token_fire::app::state::SourceHookManagers::new(
+        HookConfigManager::new(dir.path().join("traecli.toml"), paths.backups_dir.clone()),
+        CodexHookConfigManager::new(
+            dir.path().join("codex-hooks.json"),
+            paths.backups_dir.clone(),
+        ),
+        ClaudeHookConfigManager::new(claude_config, paths.backups_dir.clone()),
+        CursorHookConfigManager::new(
+            dir.path().join("cursor-hooks.json"),
+            paths.backups_dir.clone(),
+        ),
+    );
+    let app_state = AppState::new_with_source_hook_managers(paths, managers);
+    let success_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Claude,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: success_at,
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Claude,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::None,
+            seen_at: success_at + chrono::Duration::minutes(1),
+            inserted: None,
+            duplicates: None,
+            skipped_outside_tracking: None,
+            empty_reason: None,
+            error_kind: Some("transcript_unreadable".to_string()),
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(success_at + chrono::Duration::minutes(3))
+        .unwrap();
+    let claude = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Claude)
+        .unwrap();
+
+    assert_eq!(claude.headline, DiagnosticHeadline::ConfigurationError);
+    assert!(claude.trust_summary.contains("最新问题"));
+    assert_eq!(
+        diagnostic_evidence_value(claude, "数据库证据", "可信状态"),
+        Some("被当前问题覆盖")
+    );
+    assert_eq!(
+        diagnostic_evidence_value(claude, "最新问题", "最新问题"),
+        Some("采集配置错误")
+    );
+}
+
+#[test]
+fn source_diagnostics_uses_recent_storage_success_but_not_old_storage() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let store = UsageStore::open(&paths.database).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    let recent_row =
+        normalized_observation("recent-codex-row", "codex", Some("codex-model"), 100, now);
+    let window_id = store
+        .open_tracking_window(now - chrono::Duration::minutes(1))
+        .unwrap();
+    store
+        .insert_observation_for_tracking_window(&recent_row, window_id)
+        .unwrap();
+    let conn = rusqlite::Connection::open(&paths.database).unwrap();
+    conn.execute(
+        "update token_observations set created_at = ?1 where source_record_id = ?2",
+        rusqlite::params![now.to_rfc3339(), recent_row.source_record_id],
+    )
+    .unwrap();
+    let app_state = AppState::new(paths.clone());
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(now + chrono::Duration::minutes(1))
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+    assert_eq!(codex.headline, DiagnosticHeadline::Connected);
+
+    let old_snapshot = app_state
+        .source_diagnostics_snapshot_at(now + chrono::Duration::hours(7))
+        .unwrap();
+    let old_codex = old_snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+    assert_ne!(old_codex.headline, DiagnosticHeadline::Connected);
+}
+
+#[test]
+fn source_diagnostics_prefers_newer_storage_evidence_over_older_runtime_success() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let store = UsageStore::open(&paths.database).unwrap();
+    let generated_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 30, 0).unwrap();
+    let storage_created_at = generated_at - chrono::Duration::minutes(30);
+    let row = normalized_observation(
+        "codex-storage-only-row",
+        "codex",
+        Some("codex-model"),
+        100,
+        generated_at - chrono::Duration::minutes(40),
+    );
+    let window_id = store
+        .open_tracking_window(row.observed_at - chrono::Duration::minutes(1))
+        .unwrap();
+    store
+        .insert_observation_for_tracking_window(&row, window_id)
+        .unwrap();
+    // `created_at` is the storage success clock, independent from `observed_at`.
+    let conn = rusqlite::Connection::open(&paths.database).unwrap();
+    conn.execute(
+        "update token_observations set created_at = ?1 where source_record_id = ?2",
+        rusqlite::params![storage_created_at.to_rfc3339(), row.source_record_id],
+    )
+    .unwrap();
+    let app_state = AppState::new(paths);
+    let runtime_success_at = generated_at - chrono::Duration::hours(1);
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: runtime_success_at,
+            inserted: Some(7),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+    let expected_storage_time = storage_created_at
+        .with_timezone(&Local)
+        .format("%H:%M")
+        .to_string();
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(generated_at)
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_eq!(codex.headline, DiagnosticHeadline::Connected);
+    assert_eq!(
+        codex.display_summary.detail_text,
+        format!("数据库最近写入 · {expected_storage_time}")
+    );
+    assert!(!codex.display_summary.detail_text.contains("7 条"));
+}
+
+#[test]
+fn source_diagnostics_trusts_recent_storage_success_when_latest_signal_is_noop() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let store = UsageStore::open(&paths.database).unwrap();
+    let generated_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 30, 0).unwrap();
+    let storage_created_at = generated_at - chrono::Duration::minutes(30);
+    let row = normalized_observation(
+        "codex-storage-plus-noop-row",
+        "codex",
+        Some("codex-model"),
+        100,
+        generated_at - chrono::Duration::minutes(40),
+    );
+    let window_id = store
+        .open_tracking_window(row.observed_at - chrono::Duration::minutes(1))
+        .unwrap();
+    store
+        .insert_observation_for_tracking_window(&row, window_id)
+        .unwrap();
+    let conn = rusqlite::Connection::open(&paths.database).unwrap();
+    conn.execute(
+        "update token_observations set created_at = ?1 where source_record_id = ?2",
+        rusqlite::params![storage_created_at.to_rfc3339(), row.source_record_id],
+    )
+    .unwrap();
+    let app_state = AppState::new(paths);
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: generated_at - chrono::Duration::minutes(5),
+            inserted: Some(0),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: Some(SourceEmptyReason::NoNewCompleteRound),
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(generated_at)
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_eq!(codex.headline, DiagnosticHeadline::Connected);
+    assert!(codex.trust_summary.contains("已入库"));
+    assert_eq!(
+        diagnostic_evidence_value(codex, "最近采集", "检查结果"),
+        Some("无新增完整轮次")
+    );
+    assert_eq!(
+        codex.display_summary.note_text.as_deref(),
+        Some("最新检查无新增完整轮次")
+    );
+    assert_eq!(
+        diagnostic_evidence_value(codex, "数据库证据", "可信状态"),
+        Some("可信")
+    );
+}
+
+#[test]
+fn source_diagnostics_rejects_storage_only_future_created_at_trust() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let store = UsageStore::open(&paths.database).unwrap();
+    let generated_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 30, 0).unwrap();
+    let future_storage_created_at = generated_at + chrono::Duration::minutes(30);
+    let row = normalized_observation(
+        "codex-storage-only-future-row",
+        "codex",
+        Some("codex-model"),
+        100,
+        generated_at - chrono::Duration::minutes(40),
+    );
+    let window_id = store
+        .open_tracking_window(row.observed_at - chrono::Duration::minutes(1))
+        .unwrap();
+    store
+        .insert_observation_for_tracking_window(&row, window_id)
+        .unwrap();
+    // Future storage clocks are rejected instead of trusted as synthetic success evidence.
+    let conn = rusqlite::Connection::open(&paths.database).unwrap();
+    conn.execute(
+        "update token_observations set created_at = ?1 where source_record_id = ?2",
+        rusqlite::params![future_storage_created_at.to_rfc3339(), row.source_record_id],
+    )
+    .unwrap();
+    let app_state = AppState::new(paths);
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(generated_at)
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_ne!(codex.headline, DiagnosticHeadline::Connected);
+    assert_eq!(
+        diagnostic_evidence_value(codex, "数据库证据", "可信状态"),
+        Some("缺少")
+    );
+}
+
+#[test]
+fn source_diagnostics_optional_source_with_recent_success_is_not_disabled() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let managers = token_fire::app::state::SourceHookManagers::new(
+        HookConfigManager::new(dir.path().join("traecli.toml"), paths.backups_dir.clone()),
+        CodexHookConfigManager::new(
+            dir.path().join("codex-hooks.json"),
+            paths.backups_dir.clone(),
+        ),
+        ClaudeHookConfigManager::new(
+            dir.path().join("claude-settings.json"),
+            paths.backups_dir.clone(),
+        ),
+        CursorHookConfigManager::new(
+            dir.path().join("cursor-hooks.json"),
+            paths.backups_dir.clone(),
+        ),
+    );
+    let app_state = AppState::new_with_source_hook_managers(paths, managers);
+    let success_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Cursor,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: success_at,
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(success_at + chrono::Duration::minutes(3))
+        .unwrap();
+    let cursor = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Cursor)
+        .unwrap();
+
+    assert_ne!(cursor.headline, DiagnosticHeadline::Disabled);
+}
+
+#[test]
+fn source_diagnostics_sqlite_unavailable_overrides_recent_success() {
+    let dir = tempdir().unwrap();
+    let mut paths = paths(dir.path().join("token-fire").as_path());
+    fs::create_dir_all(paths.database.parent().unwrap()).unwrap();
+    fs::write(&paths.database, b"not a sqlite database").unwrap();
+    let app_state = AppState::new(paths.clone());
+    let success_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: success_at,
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Codex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::None,
+            seen_at: success_at + chrono::Duration::minutes(1),
+            inserted: None,
+            duplicates: None,
+            skipped_outside_tracking: None,
+            empty_reason: None,
+            error_kind: Some("transcript_unreadable".to_string()),
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(success_at + chrono::Duration::minutes(3))
+        .unwrap();
+    let codex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Codex)
+        .unwrap();
+
+    assert_ne!(codex.headline, DiagnosticHeadline::Connected);
+    assert_eq!(
+        diagnostic_evidence_value(codex, "数据库证据", "数据库最近写入"),
+        Some("无法确认")
+    );
+    assert_eq!(
+        diagnostic_evidence_value(codex, "数据库证据", "可信状态"),
+        Some("被当前问题覆盖")
+    );
+    assert_eq!(
+        diagnostic_evidence_value(codex, "最新问题", "最新问题"),
+        Some("SQLite 不可用")
+    );
+}
+
+#[test]
+fn source_diagnostics_returns_storage_error_snapshot_when_sqlite_open_fails() {
+    let dir = tempdir().unwrap();
+    let mut paths = paths(dir.path().join("token-fire").as_path());
+    fs::create_dir_all(paths.database.parent().unwrap()).unwrap();
+    fs::write(&paths.database, b"not a sqlite database").unwrap();
+    let app_state = AppState::new(paths.clone());
+    app_state
+        .recent_source_signals()
+        .record(SourceSignalRecord {
+            source: TokenSourceKind::Traex,
+            event: SourceIngestEvent::Hook,
+            resolution: SourceResolution::TranscriptPath,
+            seen_at: Utc.with_ymd_and_hms(2026, 7, 10, 9, 59, 0).unwrap(),
+            inserted: Some(1),
+            duplicates: Some(0),
+            skipped_outside_tracking: Some(0),
+            empty_reason: None,
+            error_kind: None,
+        });
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap())
+        .unwrap();
+    let traex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Traex)
+        .unwrap();
+    let storage = traex
+        .chain
+        .iter()
+        .find(|stage| stage.key == DiagnosticStageKey::Storage)
+        .unwrap();
+    let body = serde_json::to_string(&snapshot).unwrap();
+
+    assert_eq!(storage.status, DiagnosticStatus::Error);
+    assert_eq!(
+        traex.primary_break.as_ref().unwrap().stage,
+        DiagnosticStageKey::Storage
+    );
+    assert!(body.contains("sqlite_unavailable"));
+    assert!(!body.contains(paths.database.to_str().unwrap()));
+    paths.database = dir.path().join("another-private-name.sqlite");
+    assert!(!body.contains(paths.database.to_str().unwrap()));
+}
+
+#[test]
+fn source_diagnostics_ignores_append_only_hook_log_for_signal_status() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let config = dir.path().join("traecli.toml");
+    let sessions_dir = dir.path().join("sessions");
+    let archived_sessions_dir = dir.path().join("archived_sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::create_dir_all(&archived_sessions_dir).unwrap();
+    let hook_path = dir
+        .path()
+        .join("TokenFire.app")
+        .join("Contents/MacOS/token-fire-hook");
+    fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+    fs::write(&hook_path, b"#!/bin/sh\n").unwrap();
+    make_executable(&hook_path);
+    let manager = HookConfigManager::new(config.clone(), paths.backups_dir.clone());
+    manager.install(&hook_path).unwrap();
+    write_jsonl_event(
+        &paths.hook_log,
+        "hook",
+        "info",
+        "hook_received",
+        json!({
+            "source": "traex",
+            "hook_path": hook_path.to_string_lossy(),
+            "ts": "2026-07-10T09:59:00Z"
+        }),
+    )
+    .unwrap();
+    let hook_log = paths.hook_log.clone();
+    let app_state = AppState::new_with_hook_config_manager_source_statuses(
+        paths,
+        manager,
+        Some(TraexStatusSource::new(
+            config,
+            hook_log,
+            TraexPaths {
+                sessions_dir,
+                archived_sessions_dir,
+            },
+        )),
+        None,
+    );
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap())
+        .unwrap();
+    let traex = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Traex)
+        .unwrap();
+    let signal = traex
+        .chain
+        .iter()
+        .find(|stage| stage.key == DiagnosticStageKey::Signal)
+        .unwrap();
+
+    assert_eq!(signal.status, DiagnosticStatus::Unknown);
+    assert!(signal.evidence.is_none());
+}
+
+#[test]
+fn source_diagnostics_marks_optional_config_without_hook_as_actionable() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let claude_config = dir.path().join("claude-settings.json");
+    fs::write(&claude_config, r#"{"hooks": {}}"#).unwrap();
+    let managers = token_fire::app::state::SourceHookManagers::new(
+        HookConfigManager::new(dir.path().join("traecli.toml"), paths.backups_dir.clone()),
+        CodexHookConfigManager::new(
+            dir.path().join("codex-hooks.json"),
+            paths.backups_dir.clone(),
+        ),
+        ClaudeHookConfigManager::new(claude_config, paths.backups_dir.clone()),
+        CursorHookConfigManager::new(
+            dir.path().join("cursor-hooks.json"),
+            paths.backups_dir.clone(),
+        ),
+    );
+    let app_state = AppState::new_with_source_hook_managers(paths, managers);
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap())
+        .unwrap();
+    let claude = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == TokenSourceKind::Claude)
+        .unwrap();
+
+    assert_ne!(claude.headline, DiagnosticHeadline::Disabled);
+    assert!(claude.primary_break.is_some());
+    assert!(claude.chain.iter().any(|stage| {
+        stage.key == DiagnosticStageKey::Participation && stage.status == DiagnosticStatus::Unknown
+    }));
+}
+
+#[test]
+fn source_diagnostics_sanitizes_config_error_paths() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path().join("token-fire").as_path());
+    let secret_dir = dir.path().join("private-config-root");
+    fs::create_dir_all(&secret_dir).unwrap();
+    let managers = token_fire::app::state::SourceHookManagers::new(
+        HookConfigManager::new(dir.path().join("traecli.toml"), paths.backups_dir.clone()),
+        CodexHookConfigManager::new(
+            dir.path().join("codex-hooks.json"),
+            paths.backups_dir.clone(),
+        ),
+        ClaudeHookConfigManager::new(secret_dir.clone(), paths.backups_dir.clone()),
+        CursorHookConfigManager::new(
+            dir.path().join("cursor-hooks.json"),
+            paths.backups_dir.clone(),
+        ),
+    );
+    let app_state = AppState::new_with_source_hook_managers(paths, managers);
+
+    let snapshot = app_state
+        .source_diagnostics_snapshot_at(Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap())
+        .unwrap();
+
+    let body = serde_json::to_string(&snapshot).unwrap();
+    assert!(body.contains("config_error") || body.contains("配置读取失败"));
+    assert!(!body.contains(secret_dir.to_str().unwrap()));
+    assert!(!body.contains(dir.path().to_str().unwrap()));
 }
 
 fn paths(home: &std::path::Path) -> RuntimePaths {

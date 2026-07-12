@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -8,7 +9,10 @@ use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, Submenu};
 use tauri::path::BaseDirectory;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, LogicalPosition, Manager, Monitor, Rect, Runtime};
+use tauri::{
+    AppHandle, Emitter, LogicalPosition, Manager, Monitor, Rect, Runtime, WebviewUrl,
+    WebviewWindowBuilder,
+};
 
 use crate::adapters::source::{SourceHookStatus, TokenSourceKind};
 use crate::app::menu::menu_labels;
@@ -117,6 +121,7 @@ pub fn menu_action_from_id(id: &str) -> Option<MenuAction> {
         "toggle_source_codex_hook" => Some(MenuAction::ToggleSourceHook(TokenSourceKind::Codex)),
         "toggle_source_claude_hook" => Some(MenuAction::ToggleSourceHook(TokenSourceKind::Claude)),
         "toggle_source_cursor_hook" => Some(MenuAction::ToggleSourceHook(TokenSourceKind::Cursor)),
+        "open_source_diagnostics" => Some(MenuAction::OpenSourceDiagnostics),
         "pause_tracking" => Some(MenuAction::PauseTracking),
         "resume_tracking" => Some(MenuAction::ResumeTracking),
         "open_logs" => Some(MenuAction::OpenLogs),
@@ -164,6 +169,14 @@ pub fn handle_menu_action_outcome<R: Runtime>(
 const PROFILE_WINDOW_WIDTH: f64 = 428.0;
 const PROFILE_WINDOW_HEIGHT: f64 = 690.0;
 const PROFILE_WINDOW_GAP: f64 = 8.0;
+const PROFILE_WINDOW_LABEL: &str = "main";
+const SOURCE_DIAGNOSTICS_WINDOW_LABEL: &str = "source-diagnostics";
+pub const SOURCE_DIAGNOSTICS_WINDOW_FOCUSED_EVENT: &str = "source_diagnostics_window_focused";
+static LAST_TRAY_RECT: OnceLock<Mutex<Option<Rect>>> = OnceLock::new();
+
+fn last_tray_rect() -> &'static Mutex<Option<Rect>> {
+    LAST_TRAY_RECT.get_or_init(|| Mutex::new(None))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ProfileWindowSize {
@@ -335,7 +348,57 @@ pub fn show_profile_window_near_tray<R: Runtime>(
     app: &AppHandle<R>,
     rect: Rect,
 ) -> tauri::Result<()> {
-    if let Some(window) = app.get_webview_window("main") {
+    show_window_near_tray(
+        app,
+        PROFILE_WINDOW_LABEL,
+        Some(rect),
+        PROFILE_WINDOW_FOCUSED_EVENT,
+    )
+}
+
+pub fn show_profile_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    // Dock reopen has no tray anchor, so reuse the profile window with monitor fallback positioning.
+    show_window_near_tray(
+        app,
+        PROFILE_WINDOW_LABEL,
+        None,
+        PROFILE_WINDOW_FOCUSED_EVENT,
+    )
+}
+
+pub fn show_source_diagnostics_window_near_tray<R: Runtime>(
+    app: &AppHandle<R>,
+    rect: Option<Rect>,
+) -> tauri::Result<()> {
+    let rect = rect.or_else(|| *last_tray_rect().lock().unwrap());
+    show_window_near_tray(
+        app,
+        SOURCE_DIAGNOSTICS_WINDOW_LABEL,
+        rect,
+        SOURCE_DIAGNOSTICS_WINDOW_FOCUSED_EVENT,
+    )
+}
+
+fn show_window_near_tray<R: Runtime>(
+    app: &AppHandle<R>,
+    label: &'static str,
+    rect: Option<Rect>,
+    focused_event: &'static str,
+) -> tauri::Result<()> {
+    let window = if let Some(window) = app.get_webview_window(label) {
+        window
+    } else {
+        WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
+            .title("TokenFire")
+            .inner_size(PROFILE_WINDOW_WIDTH, PROFILE_WINDOW_HEIGHT)
+            .resizable(false)
+            .decorations(false)
+            .transparent(true)
+            .always_on_top(true)
+            .visible(false)
+            .build()?
+    };
+    if let Some(rect) = rect {
         let fallback_scale_factor = window.scale_factor().unwrap_or(1.0);
         let tray_rect = profile_tray_rect_from_tauri(rect, fallback_scale_factor);
         let available_monitors = window.available_monitors().map(|monitors| {
@@ -364,10 +427,10 @@ pub fn show_profile_window_near_tray<R: Runtime>(
             monitor_bounds,
         );
         window.set_position(position)?;
-        window.show()?;
-        window.set_focus()?;
-        let _ = app.emit(PROFILE_WINDOW_FOCUSED_EVENT, ());
     }
+    window.show()?;
+    window.set_focus()?;
+    let _ = app.emit(focused_event, ());
     Ok(())
 }
 
@@ -411,6 +474,13 @@ pub fn build_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>>
         true,
         None::<&str>,
     )?;
+    let source_diagnostics = MenuItem::with_id(
+        app,
+        MenuAction::OpenSourceDiagnostics.to_menu_id(),
+        labels.source_diagnostics,
+        true,
+        None::<&str>,
+    )?;
     let open_logs = MenuItem::with_id(
         app,
         MenuAction::OpenLogs.to_menu_id(),
@@ -446,6 +516,7 @@ pub fn build_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>>
             &sources,
             &pause,
             &resume,
+            &source_diagnostics,
             &open_logs,
             &copy_debug,
             &enable_debug,
@@ -489,6 +560,7 @@ pub fn install_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<TrayIcon<R>
                 ..
             } = event
             {
+                *last_tray_rect().lock().unwrap() = Some(rect);
                 let _ = show_profile_window_near_tray(tray.app_handle(), rect);
             }
         })
@@ -496,6 +568,12 @@ pub fn install_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<TrayIcon<R>
             let Some(action) = menu_action_from_id(event.id().as_ref()) else {
                 return;
             };
+            if action == MenuAction::OpenSourceDiagnostics {
+                if let Err(error) = show_source_diagnostics_window_near_tray(app, None) {
+                    eprintln!("failed to show source diagnostics window: {error:#}");
+                }
+                return;
+            }
             let state = app.state::<AppState>();
             match state.handle_menu_action(action) {
                 Ok(outcome) => {

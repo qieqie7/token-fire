@@ -103,6 +103,22 @@ impl SourceErrorKind {
             SourceErrorKind::SourceAdapterFailed => "source_adapter_failed",
         }
     }
+
+    pub fn from_runtime_kind(kind: &str) -> Self {
+        match kind {
+            "transcript_read_failed" | "transcript_unreadable" => {
+                SourceErrorKind::TranscriptUnreadable
+            }
+            "transcript_parse_failed" => SourceErrorKind::TranscriptParseFailed,
+            "sqlite_write_failed" => SourceErrorKind::SqliteWriteFailed,
+            "watermark_write_failed" => SourceErrorKind::WatermarkWriteFailed,
+            "source_resolver_failed" => SourceErrorKind::SourceResolverFailed,
+            "source_adapter_failed" | "transcript_ingest_failed" | "hook_ingest_failed" => {
+                SourceErrorKind::SourceAdapterFailed
+            }
+            _ => SourceErrorKind::SourceAdapterFailed,
+        }
+    }
 }
 
 #[derive(Debug)]

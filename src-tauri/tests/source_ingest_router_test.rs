@@ -15,6 +15,7 @@ use token_fire::app::paths::RuntimePaths;
 use token_fire::app::source_ingest::{
     SourceEmptyReason, SourceIngestEvent, SourceIngestPaths, SourceIngestRouter, SourceResolution,
 };
+use token_fire::app::source_signals::{RecentSourceSignals, SourceSignalRecord};
 use token_fire::core::usage_store::UsageStore;
 
 fn runtime_paths(home: &Path) -> RuntimePaths {
@@ -90,6 +91,169 @@ fn assert_source_ingested_schema(
     assert_eq!(event["inserted"], inserted);
     assert_eq!(event["duplicates"], duplicates);
     assert_eq!(event["skipped_outside_tracking"], skipped_outside_tracking);
+}
+
+#[test]
+fn recent_source_signals_record_cursor_empty_extraction_break() {
+    let signals = RecentSourceSignals::default();
+    let seen_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    let record = SourceSignalRecord {
+        source: TokenSourceKind::Cursor,
+        event: SourceIngestEvent::Hook,
+        resolution: SourceResolution::TranscriptPath,
+        seen_at,
+        inserted: Some(0),
+        duplicates: Some(0),
+        skipped_outside_tracking: Some(0),
+        empty_reason: Some(SourceEmptyReason::NoNewCompleteRound),
+        error_kind: None,
+    };
+
+    signals.record(record.clone());
+
+    assert_eq!(signals.latest(TokenSourceKind::Cursor), Some(record));
+    assert_eq!(signals.latest(TokenSourceKind::Traex), None);
+}
+
+#[test]
+fn recent_source_signals_keeps_latest_signal_success_and_hard_failure_separate() {
+    let signals = RecentSourceSignals::default();
+    let success_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    let success = SourceSignalRecord {
+        source: TokenSourceKind::Codex,
+        event: SourceIngestEvent::Hook,
+        resolution: SourceResolution::TranscriptPath,
+        seen_at: success_at,
+        inserted: Some(1),
+        duplicates: Some(0),
+        skipped_outside_tracking: Some(0),
+        empty_reason: None,
+        error_kind: None,
+    };
+    let noop = SourceSignalRecord {
+        source: TokenSourceKind::Codex,
+        event: SourceIngestEvent::Hook,
+        resolution: SourceResolution::TranscriptPath,
+        seen_at: success_at + chrono::Duration::minutes(2),
+        inserted: Some(0),
+        duplicates: Some(0),
+        skipped_outside_tracking: Some(0),
+        empty_reason: Some(SourceEmptyReason::NoNewCompleteRound),
+        error_kind: None,
+    };
+    let hard_failure = SourceSignalRecord {
+        source: TokenSourceKind::Codex,
+        event: SourceIngestEvent::Hook,
+        resolution: SourceResolution::None,
+        seen_at: success_at + chrono::Duration::minutes(3),
+        inserted: None,
+        duplicates: None,
+        skipped_outside_tracking: None,
+        empty_reason: Some(SourceEmptyReason::TranscriptUnreadable),
+        error_kind: None,
+    };
+
+    signals.record(success.clone());
+    signals.record(noop.clone());
+    let state = signals.latest_state(TokenSourceKind::Codex).unwrap();
+
+    assert_eq!(state.latest_signal, Some(noop.clone()));
+    assert_eq!(state.latest_success, Some(success.clone()));
+    assert_eq!(state.latest_hard_failure, None);
+
+    signals.record(hard_failure.clone());
+    let state = signals.latest_state(TokenSourceKind::Codex).unwrap();
+
+    assert_eq!(state.latest_signal, Some(hard_failure.clone()));
+    assert_eq!(state.latest_success, Some(success));
+    assert_eq!(state.latest_hard_failure, Some(hard_failure));
+}
+
+#[test]
+fn recent_source_signals_treats_outside_tracking_as_neutral() {
+    let signals = RecentSourceSignals::default();
+    let seen_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    let outside_window = SourceSignalRecord {
+        source: TokenSourceKind::Codex,
+        event: SourceIngestEvent::Hook,
+        resolution: SourceResolution::TranscriptPath,
+        seen_at,
+        inserted: Some(0),
+        duplicates: Some(0),
+        skipped_outside_tracking: Some(895),
+        empty_reason: Some(SourceEmptyReason::OutsideTrackingWindow),
+        error_kind: None,
+    };
+
+    signals.record(outside_window.clone());
+    let state = signals.latest_state(TokenSourceKind::Codex).unwrap();
+
+    assert_eq!(state.latest_signal, Some(outside_window));
+    assert_eq!(state.latest_success, None);
+    assert_eq!(state.latest_hard_failure, None);
+}
+
+#[test]
+fn recent_source_signals_ignore_out_of_order_older_records() {
+    let signals = RecentSourceSignals::default();
+    let success_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 5, 0).unwrap();
+    let success = SourceSignalRecord {
+        source: TokenSourceKind::Codex,
+        event: SourceIngestEvent::Hook,
+        resolution: SourceResolution::TranscriptPath,
+        seen_at: success_at,
+        inserted: Some(1),
+        duplicates: Some(0),
+        skipped_outside_tracking: Some(0),
+        empty_reason: None,
+        error_kind: None,
+    };
+    let older_noop = SourceSignalRecord {
+        source: TokenSourceKind::Codex,
+        event: SourceIngestEvent::Hook,
+        resolution: SourceResolution::TranscriptPath,
+        seen_at: success_at - chrono::Duration::minutes(3),
+        inserted: Some(0),
+        duplicates: Some(0),
+        skipped_outside_tracking: Some(0),
+        empty_reason: Some(SourceEmptyReason::NoNewCompleteRound),
+        error_kind: None,
+    };
+    let newer_hard_failure = SourceSignalRecord {
+        source: TokenSourceKind::Codex,
+        event: SourceIngestEvent::Hook,
+        resolution: SourceResolution::None,
+        seen_at: success_at + chrono::Duration::minutes(5),
+        inserted: None,
+        duplicates: None,
+        skipped_outside_tracking: None,
+        empty_reason: Some(SourceEmptyReason::TranscriptUnreadable),
+        error_kind: None,
+    };
+    let older_hard_failure = SourceSignalRecord {
+        source: TokenSourceKind::Codex,
+        event: SourceIngestEvent::Hook,
+        resolution: SourceResolution::None,
+        seen_at: success_at + chrono::Duration::minutes(2),
+        inserted: None,
+        duplicates: None,
+        skipped_outside_tracking: None,
+        empty_reason: Some(SourceEmptyReason::InputMissing),
+        error_kind: None,
+    };
+
+    signals.record(success.clone());
+    signals.record(older_noop);
+    let state = signals.latest_state(TokenSourceKind::Codex).unwrap();
+    assert_eq!(state.latest_signal, Some(success.clone()));
+    assert_eq!(state.latest_success, Some(success.clone()));
+
+    signals.record(newer_hard_failure.clone());
+    signals.record(older_hard_failure);
+    let state = signals.latest_state(TokenSourceKind::Codex).unwrap();
+    assert_eq!(state.latest_signal, Some(newer_hard_failure.clone()));
+    assert_eq!(state.latest_success, Some(success));
+    assert_eq!(state.latest_hard_failure, Some(newer_hard_failure));
 }
 
 #[test]

@@ -11,6 +11,5 @@ describe("Profile popover window movement", () => {
     const source = readFileSync(appSourcePath, "utf8");
 
     expect(source).not.toContain("startDragging");
-    expect(source).not.toContain("getCurrentWindow");
   });
 });

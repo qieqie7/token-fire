@@ -51,6 +51,19 @@ fn insert_tracked(
     store.insert_observation_for_tracking_window(row, window_id)
 }
 
+#[test]
+fn latest_observation_created_at_by_source_returns_recent_created_at() {
+    let dir = tempdir().unwrap();
+    let store = UsageStore::open(&dir.path().join("token-fire.sqlite")).unwrap();
+    let observed_at = Utc.with_ymd_and_hms(2026, 7, 10, 9, 0, 0).unwrap();
+    let row = observation("source-latest", 42, observed_at);
+    insert_tracked(&store, &row).unwrap();
+
+    let latest = store.latest_observation_created_at_by_source(20).unwrap();
+
+    assert!(latest.contains_key("traex"));
+}
+
 fn insert_tracked_without_validation(
     db_path: &Path,
     row: &NormalizedObservation,

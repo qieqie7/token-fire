@@ -415,7 +415,12 @@ fn tray_title_and_menu_labels_cover_v1_ui_surface() {
     assert_eq!(labels.codex_source, "Codex");
     assert_eq!(labels.claude_source, "Claude");
     assert_eq!(labels.cursor_source, "Cursor");
+    assert_eq!(labels.source_diagnostics, "接入诊断...");
     assert_eq!(labels.enable_debug_logging, "开启调试日志");
+    assert_eq!(
+        MenuAction::OpenSourceDiagnostics.to_menu_id(),
+        "open_source_diagnostics"
+    );
     assert_eq!(
         MenuAction::ToggleSourceHook(TokenSourceKind::Traex).to_menu_id(),
         "toggle_source_traex_hook"
@@ -631,6 +636,13 @@ fn maintenance_menu_does_not_expose_widget_toggle() {
 
     assert!(!menu_rs.contains("toggle_widget"));
     assert!(!tray_rs.contains("toggle_widget"));
+    let diagnostics_index = tray_rs
+        .find("labels.source_diagnostics")
+        .expect("source diagnostics menu item is built");
+    let open_logs_index = tray_rs
+        .find("labels.open_logs")
+        .expect("open logs menu item is built");
+    assert!(diagnostics_index < open_logs_index);
 }
 
 #[test]
@@ -645,6 +657,42 @@ fn profile_window_uses_tray_rect_instead_of_click_position() {
     assert!(click_handler.contains("show_profile_window_near_tray(tray.app_handle(), rect)"));
     assert!(!click_handler.contains("show_profile_window_near_tray(tray.app_handle(), position)"));
     assert!(!tray_rs.contains("position.x / scale_factor - 214.0"));
+}
+
+#[test]
+fn source_diagnostics_window_reuses_profile_geometry_with_cached_tray_rect() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tray_rs = std::fs::read_to_string(manifest_dir.join("src/app/tray.rs")).unwrap();
+    let main_rs = std::fs::read_to_string(manifest_dir.join("src/main.rs")).unwrap();
+
+    assert!(tray_rs.contains("SOURCE_DIAGNOSTICS_WINDOW_LABEL: &str = \"source-diagnostics\""));
+    assert!(tray_rs.contains(
+        "SOURCE_DIAGNOSTICS_WINDOW_FOCUSED_EVENT: &str = \"source_diagnostics_window_focused\""
+    ));
+    assert!(tray_rs.contains("static LAST_TRAY_RECT"));
+    assert!(tray_rs.contains("show_source_diagnostics_window_near_tray"));
+    assert!(tray_rs.contains("rect.or_else(|| *last_tray_rect().lock().unwrap())"));
+    assert!(tray_rs.contains("show_window_near_tray("));
+    assert!(tray_rs.contains("PROFILE_WINDOW_WIDTH"));
+    assert!(tray_rs.contains("PROFILE_WINDOW_HEIGHT"));
+    assert!(tray_rs.contains("WebviewWindowBuilder::new(app, label"));
+    assert!(tray_rs.contains("MenuAction::OpenSourceDiagnostics"));
+    assert!(tray_rs.contains("show_source_diagnostics_window_near_tray(app, None)"));
+    assert!(main_rs.contains("matches!(window.label(), \"main\" | \"source-diagnostics\")"));
+}
+
+#[test]
+fn dock_reopen_shows_the_profile_window_without_a_tray_anchor() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tray_rs = std::fs::read_to_string(manifest_dir.join("src/app/tray.rs")).unwrap();
+    let main_rs = std::fs::read_to_string(manifest_dir.join("src/main.rs")).unwrap();
+
+    assert!(tray_rs.contains("pub fn show_profile_window<R: Runtime>"));
+    assert!(tray_rs.contains("show_window_near_tray("));
+    assert!(tray_rs.contains("PROFILE_WINDOW_LABEL"));
+    assert!(tray_rs.contains("None"));
+    assert!(main_rs.contains("tauri::RunEvent::Reopen"));
+    assert!(main_rs.contains("show_profile_window(app_handle)"));
 }
 
 #[test]

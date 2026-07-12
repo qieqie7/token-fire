@@ -19,7 +19,11 @@ use crate::app::ingest_scheduler::{IngestReport, IngestScheduler};
 use crate::app::logging::{append_app_log, DebugLogGate, LogFile, RuntimeLogSinks, RuntimeLogger};
 use crate::app::paths::RuntimePaths;
 use crate::app::socket_server::SocketServer;
-use crate::app::source_ingest::{source_error_kind, SourceIngestPaths, SourceIngestRouter};
+use crate::app::source_ingest::{
+    source_error_kind, SourceErrorKind, SourceIngestEvent, SourceIngestOutcome, SourceIngestPaths,
+    SourceIngestRouter, SourceResolution,
+};
+use crate::app::source_signals::{RecentSourceSignals, SourceSignalRecord};
 use crate::app::state::{AppState, RuntimeHealthReporter};
 use crate::app::tracking::TrackingGate;
 use crate::app::widget_events::WidgetEventEmitter;
@@ -139,6 +143,7 @@ impl AppRuntime {
             logger,
             health_reporter,
             WidgetEventEmitter::noop(),
+            RecentSourceSignals::default(),
         )
     }
 
@@ -149,6 +154,7 @@ impl AppRuntime {
         logger: RuntimeLogger,
         health_reporter: Option<RuntimeHealthReporter>,
         widget_events: WidgetEventEmitter,
+        recent_source_signals: RecentSourceSignals,
     ) -> anyhow::Result<Self> {
         let (hook_tx, hook_rx) = mpsc::channel::<HookMetadata>();
         let (source_path_tx, source_path_rx) = mpsc::channel::<SourceFileEvent>();
@@ -232,15 +238,17 @@ impl AppRuntime {
         let worker_registry = source_registry.clone();
         let worker_tracking_gate = tracking_gate.clone();
         let worker_widget_events = widget_events.clone();
+        let worker_signals = recent_source_signals.clone();
         let worker = thread::spawn(move || {
             for event in event_rx {
-                match handle_runtime_event_with_logger_and_widget_events(
+                match handle_runtime_event_with_logger_widget_events_and_signals(
                     event.clone(),
                     &worker_registry,
                     &scheduler,
                     &worker_tracking_gate,
                     &logger,
                     &worker_widget_events,
+                    &worker_signals,
                 ) {
                     Ok(Some(_)) => {
                         if let Some(health_reporter) = &health_reporter {
@@ -630,6 +638,7 @@ pub fn start_app_runtime_for_state_with_widget_events(
         logger.clone(),
         Some(state.runtime_health_reporter()),
         widget_events,
+        state.recent_source_signals(),
     ) {
         Ok(runtime) => {
             state.set_socket_ok(true);
@@ -686,6 +695,7 @@ pub fn handle_runtime_event(
         None,
         SourceIngestPaths::default(),
     )
+    .map(|outcome| outcome.report)
 }
 
 pub fn handle_runtime_event_with_logger(
@@ -695,6 +705,17 @@ pub fn handle_runtime_event_with_logger(
     tracking_gate: &TrackingGate,
     logger: &RuntimeLogger,
 ) -> anyhow::Result<Option<IngestReport>> {
+    handle_runtime_event_outcome_with_logger(event, registry, scheduler, tracking_gate, logger)
+        .map(|outcome| outcome.report)
+}
+
+fn handle_runtime_event_outcome_with_logger(
+    event: RuntimeEvent,
+    registry: &SourceRegistry,
+    scheduler: &IngestScheduler,
+    tracking_gate: &TrackingGate,
+    logger: &RuntimeLogger,
+) -> anyhow::Result<SourceIngestOutcome> {
     let event_kind = match &event {
         RuntimeEvent::Hook { .. } => "hook",
         RuntimeEvent::TranscriptChanged { .. } => "transcript_changed",
@@ -734,6 +755,7 @@ pub fn handle_runtime_event_with_cursor_home(
             cursor_watermark_dir: cursor_watermark_dir.map(Path::to_path_buf),
         },
     )
+    .map(|outcome| outcome.report)
 }
 
 pub fn handle_runtime_event_with_logger_and_widget_events(
@@ -744,14 +766,48 @@ pub fn handle_runtime_event_with_logger_and_widget_events(
     logger: &RuntimeLogger,
     widget_events: &WidgetEventEmitter,
 ) -> anyhow::Result<Option<IngestReport>> {
-    let result = handle_runtime_event_with_logger(
+    handle_runtime_event_with_logger_widget_events_and_signals(
+        event,
+        registry,
+        scheduler,
+        tracking_gate,
+        logger,
+        widget_events,
+        &RecentSourceSignals::default(),
+    )
+}
+
+pub fn handle_runtime_event_with_logger_widget_events_and_signals(
+    event: RuntimeEvent,
+    registry: &SourceRegistry,
+    scheduler: &IngestScheduler,
+    tracking_gate: &TrackingGate,
+    logger: &RuntimeLogger,
+    widget_events: &WidgetEventEmitter,
+    signals: &RecentSourceSignals,
+) -> anyhow::Result<Option<IngestReport>> {
+    let outcome = match handle_runtime_event_outcome_with_logger(
         event.clone(),
         registry,
         scheduler,
         tracking_gate,
         logger,
-    )?;
-    if let Some(report) = &result {
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let (source, event_kind) = runtime_event_source_and_kind(&event);
+            let kind = runtime_event_error_kind(&event, &error);
+            signals.record(SourceSignalRecord::from_error(
+                source,
+                event_kind,
+                Utc::now(),
+                SourceErrorKind::from_runtime_kind(kind),
+            ));
+            return Err(error);
+        }
+    };
+    signals.record(SourceSignalRecord::from_outcome(&outcome, Utc::now()));
+    if let Some(report) = &outcome.report {
         if report.inserted > 0 {
             match scheduler.widget_state_changed_event(report.inserted) {
                 Ok(payload) => widget_events.emit_usage_facts_invalidated(payload),
@@ -759,7 +815,7 @@ pub fn handle_runtime_event_with_logger_and_widget_events(
             }
         }
     }
-    Ok(result)
+    Ok(outcome.report)
 }
 
 pub fn log_runtime_event_failure(
@@ -808,6 +864,15 @@ fn runtime_event_error_kind(event: &RuntimeEvent, error: &anyhow::Error) -> &'st
     }
 }
 
+fn runtime_event_source_and_kind(event: &RuntimeEvent) -> (TokenSourceKind, SourceIngestEvent) {
+    match event {
+        RuntimeEvent::Hook { source, .. } => (*source, SourceIngestEvent::Hook),
+        RuntimeEvent::TranscriptChanged { source, .. } => {
+            (*source, SourceIngestEvent::TranscriptChanged)
+        }
+    }
+}
+
 fn handle_runtime_event_inner(
     event: RuntimeEvent,
     registry: &SourceRegistry,
@@ -815,9 +880,16 @@ fn handle_runtime_event_inner(
     tracking_gate: &TrackingGate,
     logger: Option<&RuntimeLogger>,
     source_paths: SourceIngestPaths,
-) -> anyhow::Result<Option<IngestReport>> {
+) -> anyhow::Result<SourceIngestOutcome> {
     if tracking_gate.is_paused() {
-        return Ok(None);
+        let (source, event) = runtime_event_source_and_kind(&event);
+        return Ok(SourceIngestOutcome {
+            report: None,
+            source,
+            event,
+            resolution: SourceResolution::None,
+            empty_reason: None,
+        });
     }
 
     let router = SourceIngestRouter {
@@ -827,7 +899,7 @@ fn handle_runtime_event_inner(
         paths: source_paths,
     };
 
-    let outcome = match event {
+    Ok(match event {
         RuntimeEvent::Hook { source, metadata } => router.ingest_hook(source, metadata)?,
         RuntimeEvent::TranscriptChanged { source, path } => {
             scheduler.log(
@@ -839,9 +911,7 @@ fn handle_runtime_event_inner(
             );
             router.ingest_file_changed(source, path)?
         }
-    };
-
-    Ok(outcome.report)
+    })
 }
 
 pub fn token_fire_hook_path_from_exe(app_exe: &Path) -> PathBuf {

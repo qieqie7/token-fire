@@ -19,6 +19,10 @@ use crate::app::floating_widget::WidgetState;
 use crate::app::logging::{write_jsonl_event, DebugLogGate, RuntimeLogSinks};
 use crate::app::paths::RuntimePaths;
 use crate::app::runtime::token_fire_hook_path_from_exe;
+use crate::app::source_diagnostics::{
+    build_source_diagnostics_snapshot, SourceDiagnosticsInput, SourceDiagnosticsSnapshot,
+};
+use crate::app::source_signals::RecentSourceSignals;
 use crate::app::status::{ui_status_from_sources, UiStatus};
 use crate::app::tracking::TrackingGate;
 use crate::core::pricing::WidgetCostSummary;
@@ -38,6 +42,7 @@ pub struct AppState {
     last_unverified_hook_last_seen_at: Mutex<Option<DateTime<chrono::Utc>>>,
     tracking_gate: TrackingGate,
     debug_log_gate: DebugLogGate,
+    recent_source_signals: RecentSourceSignals,
 }
 
 #[derive(Clone)]
@@ -92,6 +97,7 @@ impl SourceHookManagers {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     ToggleSourceHook(TokenSourceKind),
+    OpenSourceDiagnostics,
     InstallHook,
     UninstallHook,
     InstallTraexHook,
@@ -113,6 +119,7 @@ impl MenuAction {
             MenuAction::ToggleSourceHook(TokenSourceKind::Codex) => "toggle_source_codex_hook",
             MenuAction::ToggleSourceHook(TokenSourceKind::Claude) => "toggle_source_claude_hook",
             MenuAction::ToggleSourceHook(TokenSourceKind::Cursor) => "toggle_source_cursor_hook",
+            MenuAction::OpenSourceDiagnostics => "open_source_diagnostics",
             MenuAction::InstallHook | MenuAction::InstallTraexHook => "install_traex_hook",
             MenuAction::UninstallHook | MenuAction::UninstallTraexHook => "uninstall_traex_hook",
             MenuAction::InstallCodexHook => "install_codex_hook",
@@ -368,6 +375,10 @@ impl AppState {
         }
     }
 
+    pub fn recent_source_signals(&self) -> RecentSourceSignals {
+        self.recent_source_signals.clone()
+    }
+
     pub fn refresh_traex_status(&self) -> TraexStatus {
         if let Some(source) = &self.traex_status_source {
             let status = source.collect();
@@ -464,6 +475,7 @@ impl AppState {
                 self.toggle_source_hook(source)?;
                 Ok(MenuActionOutcome::Handled)
             }
+            MenuAction::OpenSourceDiagnostics => Ok(MenuActionOutcome::Handled),
             MenuAction::InstallHook | MenuAction::InstallTraexHook => {
                 self.hook_managers
                     .traex()
@@ -584,6 +596,29 @@ impl AppState {
         ]
     }
 
+    pub fn source_diagnostics_snapshot_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<SourceDiagnosticsSnapshot> {
+        let mut sqlite_ok = self.sqlite_ok.load(Ordering::Relaxed);
+        let latest_storage_by_source = match UsageStore::open(&self.paths.database)
+            .and_then(|store| store.latest_observation_created_at_by_source(20))
+        {
+            Ok(latest_storage_by_source) => latest_storage_by_source,
+            Err(_) => {
+                sqlite_ok = false;
+                Default::default()
+            }
+        };
+        Ok(build_source_diagnostics_snapshot(SourceDiagnosticsInput {
+            generated_at: now,
+            hook_statuses: self.source_hook_statuses(),
+            source_signal_states: self.recent_source_signals.state_snapshot(),
+            latest_storage_by_source,
+            sqlite_ok,
+        }))
+    }
+
     fn debug_bundle_source_statuses(&self) -> Vec<SourceStatus> {
         let mut statuses = self.refresh_source_statuses();
         for hook_status in self.source_hook_statuses() {
@@ -648,6 +683,7 @@ impl AppState {
             last_unverified_hook_last_seen_at: Mutex::new(None),
             tracking_gate,
             debug_log_gate,
+            recent_source_signals: RecentSourceSignals::default(),
         }
     }
 

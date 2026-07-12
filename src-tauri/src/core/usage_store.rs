@@ -1788,6 +1788,38 @@ impl UsageStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn latest_observation_created_at_by_source(
+        &self,
+        limit: i64,
+    ) -> anyhow::Result<BTreeMap<String, DateTime<Utc>>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            select source, max(created_at)
+            from token_observations
+            where tracking_window_id is not null
+            group by source
+            order by max(created_at) desc
+            limit ?1
+            "#,
+        )?;
+        let rows = stmt.query_map([limit], |row| {
+            let source: String = row.get(0)?;
+            let created_at: String = row.get(1)?;
+            let created_at = DateTime::parse_from_rfc3339(&created_at)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            Ok((source, created_at))
+        })?;
+        rows.collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn set_file_baseline(&self, source_path: &str, byte_offset: i64) -> anyhow::Result<()> {
         self.conn.execute(
             r#"
