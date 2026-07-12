@@ -16,7 +16,7 @@ pub const GITHUB_LATEST_RELEASE_API_URL: &str =
     "https://api.github.com/repos/qieqie7/token-fire/releases/latest";
 pub const GITHUB_RELEASES_URL: &str = "https://github.com/qieqie7/token-fire/releases";
 pub const RELEASE_UPDATE_CHANGED_EVENT: &str = "release_update_changed";
-const SUCCESS_CHECK_TTL_HOURS: i64 = 24;
+const SUCCESS_CHECK_TTL_HOURS: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubRelease {

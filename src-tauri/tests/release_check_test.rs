@@ -159,10 +159,13 @@ fn release_check_cache_reuses_only_recent_successful_checks_for_current_version(
     });
 
     assert!(
-        cache.should_reuse_success(&identity("0.1.0"), checked_at + chrono::Duration::hours(23))
+        cache.should_reuse_success(&identity("0.1.0"), checked_at + chrono::Duration::hours(2))
     );
     assert!(
-        !cache.should_reuse_success(&identity("0.1.0"), checked_at + chrono::Duration::hours(25))
+        !cache.should_reuse_success(&identity("0.1.0"), checked_at + chrono::Duration::hours(3))
+    );
+    assert!(
+        !cache.should_reuse_success(&identity("0.1.0"), checked_at + chrono::Duration::hours(4))
     );
     assert!(
         !cache.should_reuse_success(&identity("0.1.1"), checked_at + chrono::Duration::hours(1))
