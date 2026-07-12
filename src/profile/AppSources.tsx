@@ -1,6 +1,7 @@
 import type { RankedProfileBreakdown } from "./types";
 
-const SOURCE_COLORS = ["#ff8a34", "#f6c85f", "#6ee7b7", "#3f4652"] as const;
+const TOP_SOURCE_LIMIT = 5;
+const SOURCE_COLORS = ["#ff8a34", "#f6c85f", "#6ee7b7", "#60a5fa", "#c084fc", "#3f4652"] as const;
 
 function displayLabel(label: string) {
   if (label === "Unknown") return "未知";
@@ -9,8 +10,8 @@ function displayLabel(label: string) {
 }
 
 function compactRows(rows: RankedProfileBreakdown[]) {
-  const visible = rows.slice(0, 3);
-  const remainder = rows.slice(3);
+  const visible = rows.slice(0, TOP_SOURCE_LIMIT);
+  const remainder = rows.slice(TOP_SOURCE_LIMIT);
   if (remainder.length === 0) return visible;
 
   const estimatedCost = remainder.reduce((total, row) => total + row.estimated_cost, 0);
@@ -52,7 +53,7 @@ export function AppSources({ rows }: { rows: RankedProfileBreakdown[] }) {
     <section className="profile-panel profile-sources" aria-label="应用来源">
       <div className="profile-section-head">
         <span>应用来源</span>
-        <span>按 token 前 3</span>
+        <span>按 token 前 {TOP_SOURCE_LIMIT}</span>
       </div>
       <div className="profile-source-body">
         <div
