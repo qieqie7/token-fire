@@ -726,3 +726,90 @@ fn main_runtime_registers_release_update_commands_and_startup_check() {
     assert!(main_rs.contains("start_release_check_on_startup"));
     assert!(!main_rs.contains("tauri_plugin_updater"));
 }
+
+// Task 7: profile_summary command 必须异步且把 SQLite 工作放进 spawn_blocking，不在 command
+// body 直接 open store（否则同步 SQLite 会跑在 async executor 主线程上，导致 UI freeze）。
+#[test]
+fn profile_summary_command_is_async_and_offloads_sqlite() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main_rs = fs::read_to_string(manifest_dir.join("src/main.rs")).unwrap();
+    let profile_query_rs =
+        fs::read_to_string(manifest_dir.join("src/app/profile_query.rs")).unwrap();
+
+    // command 是 async。
+    assert!(
+        main_rs.contains("async fn profile_summary"),
+        "profile_summary 必须是 async command"
+    );
+    // blocking 查询在 spawn_blocking 中执行。
+    assert!(
+        profile_query_rs.contains("tauri::async_runtime::spawn_blocking"),
+        "profile_query 必须用 spawn_blocking 卸载 SQLite"
+    );
+    // command body 不直接 open store（SQLite open 应在 spawn_blocking closure 内）。
+    assert!(
+        !main_rs.contains("UsageStore::open"),
+        "main.rs command body 不得直接 UsageStore::open"
+    );
+    assert!(
+        profile_query_rs.contains("UsageStore::open"),
+        "UsageStore::open 应位于 spawn_blocking closure 内 (profile_query.rs)"
+    );
+}
+
+// Task 7: 通过 async_runtime::block_on 驱动 blocking 查询函数，验证它对临时数据库返回可用 DTO。
+#[test]
+fn profile_summary_query_returns_dto_via_block_on() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let now_utc = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+    {
+        let store = UsageStore::open(&db_path).unwrap();
+        let window_id = store
+            .open_tracking_window(now_utc - Duration::days(1))
+            .unwrap();
+        let mut row = token_fire::core::observation::NormalizedObservation {
+            source: "traex".to_string(),
+            adapter_version: "traex-jsonl-v1".to_string(),
+            source_record_id: "async-profile-1".to_string(),
+            source_record_id_confidence:
+                token_fire::core::observation::SourceRecordIdConfidence::Exact,
+            session_id: Some("s".to_string()),
+            turn_id: Some("t".to_string()),
+            turn_boundary_id: Some("t".to_string()),
+            source_path: Some("/tmp/async-profile.jsonl".to_string()),
+            line_no: Some(1),
+            byte_offset: Some(10),
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 1_000_000,
+            cumulative_total_tokens: Some(1_000_000),
+            model: Some("gpt-5.5".to_string()),
+            cwd: Some("~/p".to_string()),
+            observed_at: now_utc - Duration::hours(2),
+            token_payload_hash: "hash-async-1".to_string(),
+        };
+        row.total_tokens = 1_000_000;
+        store
+            .insert_observation_for_tracking_window(&row, window_id)
+            .unwrap();
+    }
+
+    let outcome =
+        tauri::async_runtime::block_on(token_fire::app::profile_query::query_profile_summary(
+            db_path,
+            token_fire::core::profile::ProfilePeriod::Today,
+            now_utc,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        outcome.summary.selected_period.period,
+        token_fire::core::profile::ProfilePeriod::Today
+    );
+    assert_eq!(outcome.summary.year_profile.days.len(), 365);
+    assert_eq!(outcome.summary.selected_period.total_tokens, 1_000_000);
+}

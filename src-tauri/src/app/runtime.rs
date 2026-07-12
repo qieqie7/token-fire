@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Days, Local, Utc};
 use notify::RecommendedWatcher;
@@ -173,6 +173,9 @@ impl AppRuntime {
             Utc::now(),
             RetentionPolicy::default(),
         );
+        // retention 之后、baseline/scheduler 之前做一次 rollup 就绪维护（校验或原子重建）。
+        // store 在 IngestScheduler::new_with_logs 消费前仍是 &mut，插入点必须落在此窗口内。
+        run_startup_profile_rollup_maintenance(&mut store, &log_sinks);
         let codex_sources = active_sources
             .iter()
             .filter(|source| source.kind == TokenSourceKind::Codex)
@@ -539,6 +542,46 @@ fn log_retention_outcome(
             "policy_days": policy.observation_retention_days
         }),
     );
+}
+
+/// 启动时的 rollup 就绪维护：调用 `ensure_profile_rollup_ready`（Ready 则跳过重建，
+/// 否则原子重建）。镜像 `run_startup_retention` 的形状——失败只记日志、绝不返回启动错误，
+/// runtime 照常启动；Profile 后续可退回 raw fallback（Task 6）。
+///
+/// 诊断日志（LogFile::Db）只含 duration/status/version/row-count；
+/// 绝不传入 model/source path/session id/观测内容（日志层虽会剥离 FORBIDDEN key，此处从不传）。
+pub fn run_startup_profile_rollup_maintenance(store: &mut UsageStore, sinks: &RuntimeLogSinks) {
+    let started = Instant::now();
+    match store.ensure_profile_rollup_ready() {
+        Ok(outcome) => {
+            let status = if outcome.rebuilt { "rebuilt" } else { "ready" };
+            sinks.write(
+                LogFile::Db,
+                "db",
+                "info",
+                "rollup_rebuild_status",
+                json!({
+                    "rollup_rebuild_status": status,
+                    "rollup_rebuild_duration_ms": started.elapsed().as_millis() as u64,
+                    "rollup_row_count": outcome.rollup_row_count,
+                    "rollup_schema_version": outcome.schema_version,
+                }),
+            );
+        }
+        Err(_) => {
+            sinks.write(
+                LogFile::Db,
+                "db",
+                "warn",
+                "rollup_rebuild_status",
+                json!({
+                    "rollup_rebuild_status": "failed",
+                    "rollup_rebuild_duration_ms": started.elapsed().as_millis() as u64,
+                    "error_kind": "rollup_rebuild_failed",
+                }),
+            );
+        }
+    }
 }
 
 pub fn start_app_runtime_for_state(

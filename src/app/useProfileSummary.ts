@@ -65,8 +65,9 @@ export function createProfileSummaryController({
         onLoading(false);
       },
       () => {
+        // 失败时保留上一次成功 summary（不调用 onSummary(null)），仅置 error + 结束 loading；
+        // 过期请求（requestId 不是最新）直接丢弃，不清除新请求的 loading/error 状态。
         if (stopped || requestId !== latestRequestId) return;
-        onSummary(null);
         onError(true);
         onLoading(false);
       },

@@ -1,14 +1,16 @@
 use std::path::Path;
 
-use chrono::{Datelike, Local, TimeZone, Utc};
+use chrono::{Datelike, FixedOffset, Local, Offset, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use tempfile::tempdir;
 use token_fire::core::observation::{NormalizedObservation, SourceRecordIdConfidence};
 use token_fire::core::pricing::{PricingStatus, DEFAULT_AVERAGE_CNY_PER_1M_TOKENS};
-use token_fire::core::profile::ProfilePeriod;
+use token_fire::core::profile::{ProfilePeriod, ProfileSummary, RankedProfileBreakdown};
+use token_fire::core::profile_rollup::{bucket_start_utc, PROFILE_ROLLUP_SCHEMA_VERSION};
 use token_fire::core::usage_series::{WIDGET_USAGE_BUCKET_MINUTES, WIDGET_USAGE_WINDOW_MINUTES};
 use token_fire::core::usage_store::{
-    InsertOutcome, RetentionPolicy, RetentionSkipReason, UsageStore,
+    InsertOutcome, ProfileQuerySource, ProfileRollupStatus, RetentionPolicy, RetentionSkipReason,
+    UsageStore,
 };
 
 fn observation(
@@ -132,6 +134,170 @@ fn assert_cost_close(actual: f64, expected: f64) {
     );
 }
 
+/// 逐条比较两个 ranked breakdown：key/label/total_tokens/share 必须精确相等，
+/// 只有浮点成本走 assert_cost_close 容差。用于证明 rollup 与 raw 排序、分组一致。
+#[allow(dead_code)]
+fn assert_breakdown_close(
+    context: &str,
+    actual: &[RankedProfileBreakdown],
+    expected: &[RankedProfileBreakdown],
+) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{context} breakdown length mismatch"
+    );
+    for (index, (actual_row, expected_row)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(actual_row.key, expected_row.key, "{context}[{index}] key");
+        assert_eq!(
+            actual_row.label, expected_row.label,
+            "{context}[{index}] label"
+        );
+        assert_eq!(
+            actual_row.total_tokens, expected_row.total_tokens,
+            "{context}[{index}] total_tokens"
+        );
+        assert_eq!(
+            actual_row.share, expected_row.share,
+            "{context}[{index}] share"
+        );
+        assert_cost_close(actual_row.estimated_cost, expected_row.estimated_cost);
+    }
+}
+
+/// 完整 ProfileSummary parity 断言：逐项比较 365 个 day bucket、model/source
+/// breakdown、cost drivers、peak day、selected period trend。token/日期/标签/排序/
+/// 桶边界必须精确相等，只有浮点成本用 assert_cost_close 容差。供后续 rollup ==
+/// raw 等价性测试复用，不允许只比较总量。
+#[allow(dead_code)]
+fn assert_profile_summary_close(actual: &ProfileSummary, expected: &ProfileSummary) {
+    assert_eq!(actual.generated_at, expected.generated_at);
+    assert_eq!(actual.currency, expected.currency);
+
+    // year profile: 逐日 heatmap 与聚合指标
+    assert_eq!(
+        actual.year_profile.days.len(),
+        expected.year_profile.days.len(),
+        "year_profile.days length"
+    );
+    for (index, (actual_day, expected_day)) in actual
+        .year_profile
+        .days
+        .iter()
+        .zip(expected.year_profile.days.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            actual_day.local_date, expected_day.local_date,
+            "year day[{index}] local_date"
+        );
+        assert_eq!(
+            actual_day.total_tokens, expected_day.total_tokens,
+            "year day[{index}] total_tokens"
+        );
+        assert_eq!(
+            actual_day.intensity, expected_day.intensity,
+            "year day[{index}] intensity"
+        );
+        assert_cost_close(actual_day.estimated_cost, expected_day.estimated_cost);
+    }
+    assert_eq!(
+        actual.year_profile.total_tokens, expected.year_profile.total_tokens,
+        "year_profile.total_tokens"
+    );
+    assert_eq!(
+        actual.year_profile.active_days, expected.year_profile.active_days,
+        "year_profile.active_days"
+    );
+    assert_cost_close(
+        actual.year_profile.estimated_cost,
+        expected.year_profile.estimated_cost,
+    );
+    assert_cost_close(
+        actual.year_profile.average_active_day_cost,
+        expected.year_profile.average_active_day_cost,
+    );
+    match (
+        &actual.year_profile.peak_day,
+        &expected.year_profile.peak_day,
+    ) {
+        (Some(actual_peak), Some(expected_peak)) => {
+            assert_eq!(
+                actual_peak.local_date, expected_peak.local_date,
+                "peak_day.local_date"
+            );
+            assert_eq!(
+                actual_peak.total_tokens, expected_peak.total_tokens,
+                "peak_day.total_tokens"
+            );
+            assert_cost_close(actual_peak.estimated_cost, expected_peak.estimated_cost);
+        }
+        (None, None) => {}
+        _ => panic!("peak_day presence mismatch"),
+    }
+
+    // selected period: 精确总量/边界/趋势桶，浮点成本走容差
+    let actual_period = &actual.selected_period;
+    let expected_period = &expected.selected_period;
+    assert_eq!(actual_period.period, expected_period.period, "period");
+    assert_eq!(
+        actual_period.started_at, expected_period.started_at,
+        "period.started_at"
+    );
+    assert_eq!(
+        actual_period.ended_at, expected_period.ended_at,
+        "period.ended_at"
+    );
+    assert_eq!(
+        actual_period.total_tokens, expected_period.total_tokens,
+        "period.total_tokens"
+    );
+    assert_cost_close(actual_period.estimated_cost, expected_period.estimated_cost);
+    // trend 只含 token/日期/标签/桶边界（无浮点），可整体精确比较
+    assert_eq!(actual_period.trend, expected_period.trend, "period.trend");
+
+    assert_breakdown_close(
+        "model_breakdown",
+        &actual_period.model_breakdown,
+        &expected_period.model_breakdown,
+    );
+    assert_breakdown_close(
+        "source_breakdown",
+        &actual_period.source_breakdown,
+        &expected_period.source_breakdown,
+    );
+
+    // cost drivers: 成本分量与比率走容差，token 计数精确
+    let actual_drivers = &actual_period.cost_drivers;
+    let expected_drivers = &expected_period.cost_drivers;
+    assert_cost_close(actual_drivers.input_cost, expected_drivers.input_cost);
+    assert_cost_close(actual_drivers.output_cost, expected_drivers.output_cost);
+    assert_cost_close(
+        actual_drivers.reasoning_output_cost,
+        expected_drivers.reasoning_output_cost,
+    );
+    assert_cost_close(
+        actual_drivers.cache_creation_input_cost,
+        expected_drivers.cache_creation_input_cost,
+    );
+    assert_cost_close(
+        actual_drivers.cached_input_cost,
+        expected_drivers.cached_input_cost,
+    );
+    assert_cost_close(
+        actual_drivers.unattributed_cost,
+        expected_drivers.unattributed_cost,
+    );
+    assert_eq!(
+        actual_drivers.cached_input_tokens, expected_drivers.cached_input_tokens,
+        "cost_drivers.cached_input_tokens"
+    );
+    assert_cost_close(
+        actual_drivers.cache_read_ratio,
+        expected_drivers.cache_read_ratio,
+    );
+}
+
 fn observation_count(db_path: &Path) -> i64 {
     Connection::open(db_path)
         .unwrap()
@@ -162,6 +328,606 @@ fn state_value(db_path: &Path, key: &str) -> Option<String> {
             |row| row.get(0),
         )
         .ok()
+}
+
+/// 读取 rollup metadata（state / schema_version 等）；缺表或缺行时返回 None。
+fn rollup_metadata_value(db_path: &Path, key: &str) -> Option<String> {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            "select value from usage_rollup_metadata where key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+fn rollup_row_count(db_path: &Path) -> i64 {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row("select count(*) from usage_rollups_15m", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RollupRow {
+    bucket_start_utc: i64,
+    source: String,
+    model: String,
+    input_tokens: i64,
+    billable_uncached_input_tokens: i64,
+    output_tokens: i64,
+    cached_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+    unattributed_total_tokens: i64,
+    total_tokens: i64,
+    observation_count: i64,
+}
+
+fn rollup_rows(db_path: &Path) -> Vec<RollupRow> {
+    let conn = Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            r#"
+            select bucket_start_utc, source, model, input_tokens, billable_uncached_input_tokens,
+                   output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                   reasoning_output_tokens, unattributed_total_tokens, total_tokens, observation_count
+            from usage_rollups_15m
+            order by bucket_start_utc, source, model
+            "#,
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(RollupRow {
+                bucket_start_utc: row.get(0)?,
+                source: row.get(1)?,
+                model: row.get(2)?,
+                input_tokens: row.get(3)?,
+                billable_uncached_input_tokens: row.get(4)?,
+                output_tokens: row.get(5)?,
+                cached_input_tokens: row.get(6)?,
+                cache_creation_input_tokens: row.get(7)?,
+                reasoning_output_tokens: row.get(8)?,
+                unattributed_total_tokens: row.get(9)?,
+                total_tokens: row.get(10)?,
+                observation_count: row.get(11)?,
+            })
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+/// 从 tracked raw 行按与 upsert/rebuild 相同的 clamp/CASE 语义聚合 8 个 token 分量 + count。
+/// 顺序：input / billable / output / cached / cache_creation / reasoning / unattributed / total / count。
+fn raw_conservation_totals(db_path: &Path) -> [i64; 9] {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            r#"
+            select
+              coalesce(sum(input_tokens), 0),
+              coalesce(sum(max(input_tokens - cached_input_tokens - cache_creation_input_tokens, 0)), 0),
+              coalesce(sum(output_tokens), 0),
+              coalesce(sum(cached_input_tokens), 0),
+              coalesce(sum(cache_creation_input_tokens), 0),
+              coalesce(sum(reasoning_output_tokens), 0),
+              coalesce(sum(case when input_tokens = 0 and output_tokens = 0 and cached_input_tokens = 0
+                        and cache_creation_input_tokens = 0 and reasoning_output_tokens = 0
+                       then max(total_tokens, 0) else 0 end), 0),
+              coalesce(sum(total_tokens), 0),
+              count(*)
+            from token_observations
+            where tracking_window_id is not null
+            "#,
+            [],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ])
+            },
+        )
+        .unwrap()
+}
+
+/// 与 raw_conservation_totals 对齐的 rollup 侧聚合（预聚合列直接求和），供全局守恒断言比较。
+fn rollup_conservation_totals(db_path: &Path) -> [i64; 9] {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            r#"
+            select
+              coalesce(sum(input_tokens), 0),
+              coalesce(sum(billable_uncached_input_tokens), 0),
+              coalesce(sum(output_tokens), 0),
+              coalesce(sum(cached_input_tokens), 0),
+              coalesce(sum(cache_creation_input_tokens), 0),
+              coalesce(sum(reasoning_output_tokens), 0),
+              coalesce(sum(unattributed_total_tokens), 0),
+              coalesce(sum(total_tokens), 0),
+              coalesce(sum(observation_count), 0)
+            from usage_rollups_15m
+            "#,
+            [],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ])
+            },
+        )
+        .unwrap()
+}
+
+/// 造一批分量丰富的 tracked 观测：既有含全部分量的行，也有 total-only（unattributed）行、
+/// 缺 model（key='' ）行与多桶多来源行，覆盖全局守恒与逐 key 语义。
+fn insert_rebuild_fixture(store: &UsageStore) {
+    let base = Utc.with_ymd_and_hms(2026, 7, 11, 12, 7, 33).unwrap();
+    insert_tracked(
+        store,
+        &cost_observation(
+            "rb-1",
+            Some("model-a"),
+            1_000_000,
+            500_000,
+            250_000,
+            100_000,
+            50_000,
+            1_900_000,
+            base,
+        ),
+    )
+    .unwrap();
+    // 同桶同 key 追加一条 total-only，验证 unattributed 单独累积。
+    insert_tracked(
+        store,
+        &cost_observation(
+            "rb-2",
+            Some("model-a"),
+            0,
+            0,
+            0,
+            0,
+            0,
+            1_000_000,
+            base + chrono::Duration::minutes(3),
+        ),
+    )
+    .unwrap();
+    // 缺 model（key=''）+ 不同来源，落入不同 rollup 行。
+    let mut codex = cost_observation(
+        "rb-3",
+        None,
+        7,
+        3,
+        0,
+        0,
+        0,
+        10,
+        base + chrono::Duration::hours(1),
+    );
+    codex.source = "codex".to_string();
+    insert_tracked(store, &codex).unwrap();
+    // 远期桶，确保多桶。
+    insert_tracked(
+        store,
+        &cost_observation(
+            "rb-4",
+            Some("model-b"),
+            2_000,
+            1_000,
+            0,
+            0,
+            0,
+            3_000,
+            base + chrono::Duration::days(3),
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn profile_rollup_rebuild_status_requires_rebuild_when_state_missing() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let store = UsageStore::open(&db_path).unwrap();
+
+    // 增量双写已建 rollup 行，但 migration 从不写 state/schema_version：启动需 rebuild。
+    insert_rebuild_fixture(&store);
+    assert_eq!(rollup_metadata_value(&db_path, "state"), None);
+
+    assert_eq!(
+        store.profile_rollup_status().unwrap(),
+        ProfileRollupStatus::RebuildRequired {
+            reason: "state_missing"
+        }
+    );
+}
+
+#[test]
+fn profile_rollup_rebuild_status_requires_rebuild_when_state_invalid() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let store = UsageStore::open(&db_path).unwrap();
+    insert_rebuild_fixture(&store);
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "insert into usage_rollup_metadata (key, value) values ('state', 'invalid')",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.profile_rollup_status().unwrap(),
+        ProfileRollupStatus::RebuildRequired {
+            reason: "state_invalid"
+        }
+    );
+}
+
+#[test]
+fn profile_rollup_rebuild_status_requires_rebuild_on_version_mismatch() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_rebuild_fixture(&store);
+    store.rebuild_profile_rollups().unwrap();
+
+    // 人为把 schema_version 改成旧值：即使 state=ready 也必须要求 rebuild。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "update usage_rollup_metadata set value = '0' where key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.profile_rollup_status().unwrap(),
+        ProfileRollupStatus::RebuildRequired {
+            reason: "version_mismatch"
+        }
+    );
+}
+
+#[test]
+fn profile_rollup_status_stays_o1_ready_and_audit_detects_checksum_mismatch() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_rebuild_fixture(&store);
+    store.rebuild_profile_rollups().unwrap();
+    assert!(matches!(
+        store.profile_rollup_status().unwrap(),
+        ProfileRollupStatus::Ready { .. }
+    ));
+    // 一致性审计在健康状态下通过。
+    assert!(store.profile_rollup_consistency_audit().unwrap());
+
+    // 篡改一行 rollup total，使全局守恒与 raw 不一致（state/version 仍 ready）。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "update usage_rollups_15m set total_tokens = total_tokens + 1 where rowid = (select min(rowid) from usage_rollups_15m)",
+            [],
+        )
+        .unwrap();
+
+    // 正常 Ready 启动路径是 O(1)：只看 state/version，不扫描 raw，故仍判定 Ready（spec 要求
+    // “Ready 启动不得扫描 raw”）。守恒失配只由显式低频审计发现，不进普通启动路径。
+    assert!(matches!(
+        store.profile_rollup_status().unwrap(),
+        ProfileRollupStatus::Ready { .. }
+    ));
+    // 显式一致性审计能检出全局守恒失配。
+    assert!(!store.profile_rollup_consistency_audit().unwrap());
+}
+
+#[test]
+fn profile_rollup_rebuild_recomputes_all_token_components_from_raw() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_rebuild_fixture(&store);
+
+    let outcome = store.rebuild_profile_rollups().unwrap();
+    assert!(outcome.rebuilt);
+    assert_eq!(outcome.schema_version, PROFILE_ROLLUP_SCHEMA_VERSION);
+    assert_eq!(outcome.rollup_row_count as i64, rollup_row_count(&db_path));
+
+    // rebuild 后所有 8 个 token 分量 + unattributed + count 的全局总和都等于 raw。
+    assert_eq!(
+        rollup_conservation_totals(&db_path),
+        raw_conservation_totals(&db_path)
+    );
+    // rebuild 翻转到 ready + 当前 schema_version。
+    assert_eq!(
+        rollup_metadata_value(&db_path, "state"),
+        Some("ready".to_string())
+    );
+    assert_eq!(
+        rollup_metadata_value(&db_path, "schema_version"),
+        Some(PROFILE_ROLLUP_SCHEMA_VERSION.to_string())
+    );
+    assert!(matches!(
+        store.profile_rollup_status().unwrap(),
+        ProfileRollupStatus::Ready { .. }
+    ));
+}
+
+#[test]
+fn profile_rollup_rebuild_shadow_failure_keeps_old_rollup_and_version() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_rebuild_fixture(&store);
+    store.rebuild_profile_rollups().unwrap();
+
+    // 记录旧完整状态：行内容 + 全局校验 + schema_version。
+    let old_rows = rollup_rows(&db_path);
+    let old_totals = rollup_conservation_totals(&db_path);
+    assert!(!old_rows.is_empty());
+
+    // 用同名 index 占用 shadow 表名：drop table if exists 不清理 index，
+    // 后续 create table usage_rollups_15m_rebuild 必失败 → rebuild body 事务回滚。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "create index usage_rollups_15m_rebuild on usage_rollups_15m(source)",
+            [],
+        )
+        .unwrap();
+
+    let err = store.rebuild_profile_rollups();
+    assert!(err.is_err(), "shadow create 冲突应使 rebuild 失败");
+
+    // 旧表仍可查询且内容不变（原子性：只可能是完整旧状态）。
+    assert_eq!(rollup_rows(&db_path), old_rows);
+    assert_eq!(rollup_conservation_totals(&db_path), old_totals);
+    // 旧 version 不变；state 不是 ready（失败后停留 invalid）。
+    assert_eq!(
+        rollup_metadata_value(&db_path, "schema_version"),
+        Some(PROFILE_ROLLUP_SCHEMA_VERSION.to_string())
+    );
+    assert_ne!(
+        rollup_metadata_value(&db_path, "state"),
+        Some("ready".to_string())
+    );
+}
+
+#[test]
+fn profile_rollup_ensure_ready_validates_once_and_does_not_rebuild_again() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_rebuild_fixture(&store);
+
+    // 首次：state 缺失 → RebuildRequired → 真正 rebuild。
+    let first = store.ensure_profile_rollup_ready().unwrap();
+    assert!(first.rebuilt);
+    assert_eq!(first.schema_version, PROFILE_ROLLUP_SCHEMA_VERSION);
+
+    // 第二次：已 Ready → 不再 rebuild，直接返回 rebuilt:false。
+    let second = store.ensure_profile_rollup_ready().unwrap();
+    assert!(!second.rebuilt);
+    assert_eq!(second.rollup_row_count, first.rollup_row_count);
+    assert_eq!(second.schema_version, PROFILE_ROLLUP_SCHEMA_VERSION);
+}
+
+#[test]
+fn profile_rollup_rebuild_bucket_matches_rust_single_write_bucket() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+
+    // 非 15 分钟对齐时间：验证 DB 侧 unixepoch()/900*900 与 Rust div_euclid 落入同一桶。
+    let observed_at = Utc.with_ymd_and_hms(2026, 7, 11, 12, 14, 59).unwrap();
+    insert_tracked(&store, &observation("bucket-parity", 100, observed_at)).unwrap();
+
+    // 增量单条写入用 Rust bucket_start_utc。
+    let rust_bucket = rollup_rows(&db_path)[0].bucket_start_utc;
+    assert_eq!(rust_bucket, bucket_start_utc(observed_at));
+
+    // 全量 rebuild 用 SQL unixepoch()/900*900 重算 bucket，必须与 Rust 相同。
+    store.rebuild_profile_rollups().unwrap();
+    let rebuilt = rollup_rows(&db_path);
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].bucket_start_utc, rust_bucket);
+}
+
+#[test]
+fn profile_rollup_write_migration_creates_tables_without_version() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+
+    UsageStore::open(&db_path).unwrap();
+
+    // migration 只建 schema：两张表存在，但不预写 schema_version / state（Task 5 拥有 rebuild）。
+    assert!(table_exists(&db_path, "usage_rollups_15m"));
+    assert!(table_exists(&db_path, "usage_rollup_metadata"));
+    assert_eq!(rollup_metadata_value(&db_path, "schema_version"), None);
+    assert_eq!(rollup_metadata_value(&db_path, "state"), None);
+    assert_eq!(rollup_row_count(&db_path), 0);
+}
+
+#[test]
+fn profile_rollup_write_tracked_insert_writes_normalized_rollup_row() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let store = UsageStore::open(&db_path).unwrap();
+    let bucket_time = Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap();
+    let expected_bucket = Utc
+        .with_ymd_and_hms(2026, 7, 11, 12, 0, 0)
+        .unwrap()
+        .timestamp();
+
+    // model=None 必须规范化为空字符串 key；billable/unattributed 走 Task 2 的 clamp/CASE 语义。
+    let component = cost_observation(
+        "rollup-component",
+        None,
+        1_000_000,
+        500_000,
+        250_000,
+        100_000,
+        50_000,
+        1_900_000,
+        bucket_time,
+    );
+    insert_tracked(&store, &component).unwrap();
+
+    // 同 bucket/source/model 的 total-only 观测应累加进同一 rollup 行，并单独累积 unattributed。
+    let total_only = cost_observation(
+        "rollup-total-only",
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1_000_000,
+        bucket_time + chrono::Duration::minutes(5),
+    );
+    insert_tracked(&store, &total_only).unwrap();
+
+    assert_eq!(observation_count(&db_path), 2);
+    let rows = rollup_rows(&db_path);
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.bucket_start_utc, expected_bucket);
+    assert_eq!(row.source, "traex");
+    assert_eq!(row.model, "");
+    assert_eq!(row.input_tokens, 1_000_000);
+    assert_eq!(row.billable_uncached_input_tokens, 650_000);
+    assert_eq!(row.output_tokens, 500_000);
+    assert_eq!(row.cached_input_tokens, 250_000);
+    assert_eq!(row.cache_creation_input_tokens, 100_000);
+    assert_eq!(row.reasoning_output_tokens, 50_000);
+    assert_eq!(row.unattributed_total_tokens, 1_000_000);
+    assert_eq!(row.total_tokens, 2_900_000);
+    assert_eq!(row.observation_count, 2);
+}
+
+#[test]
+fn profile_rollup_write_duplicate_insert_does_not_change_rollup() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let store = UsageStore::open(&db_path).unwrap();
+    let observed_at = Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap();
+    let row = observation("rollup-dup", 100, observed_at);
+
+    assert_eq!(
+        insert_tracked(&store, &row).unwrap(),
+        InsertOutcome::Inserted
+    );
+    assert_eq!(
+        insert_tracked(&store, &row).unwrap(),
+        InsertOutcome::Duplicate
+    );
+
+    let rows = rollup_rows(&db_path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].total_tokens, 100);
+    assert_eq!(rows[0].observation_count, 1);
+}
+
+#[test]
+fn profile_rollup_write_untracked_insert_writes_no_rollup_row() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let store = UsageStore::open(&db_path).unwrap();
+    let observed_at = Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap();
+
+    store
+        .insert_untracked_observation_for_test(&observation("rollup-untracked", 100, observed_at))
+        .unwrap();
+
+    assert_eq!(observation_count(&db_path), 1);
+    assert_eq!(rollup_row_count(&db_path), 0);
+}
+
+#[test]
+fn profile_rollup_write_failure_keeps_raw_and_marks_invalid() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    UsageStore::open(&db_path).unwrap();
+
+    // 在 rollup 表安装 BEFORE INSERT 失败触发器，模拟派生模型写入故障。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            r#"
+            create trigger fail_rollup_insert
+            before insert on usage_rollups_15m
+            begin
+              select raise(fail, 'rollup write failed');
+            end;
+            "#,
+        )
+        .unwrap();
+
+    let store = UsageStore::open(&db_path).unwrap();
+    let first = observation(
+        "rollup-fail-1",
+        100,
+        Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap(),
+    );
+
+    // OVERRIDE A：raw 是唯一事实源，rollup 写失败不能丢 raw；返回 Inserted 而非错误。
+    assert_eq!(
+        insert_tracked(&store, &first).unwrap(),
+        InsertOutcome::Inserted
+    );
+    assert_eq!(observation_count(&db_path), 1);
+    assert_eq!(rollup_row_count(&db_path), 0);
+    assert_eq!(
+        rollup_metadata_value(&db_path, "state"),
+        Some("invalid".to_string())
+    );
+
+    // 进入 raw-only 降级：后续 tracked insert 只写 raw，rollup 不增长，也不再报错。
+    let second = observation(
+        "rollup-fail-2",
+        200,
+        Utc.with_ymd_and_hms(2026, 7, 11, 12, 1, 0).unwrap(),
+    );
+    assert_eq!(
+        insert_tracked(&store, &second).unwrap(),
+        InsertOutcome::Inserted
+    );
+    assert_eq!(observation_count(&db_path), 2);
+    assert_eq!(rollup_row_count(&db_path), 0);
+}
+
+#[test]
+fn profile_rollup_write_connection_uses_wal_full_busy_timeout() {
+    let dir = tempdir().unwrap();
+    let store = UsageStore::open(&dir.path().join("token-fire.sqlite")).unwrap();
+
+    // OVERRIDE C：Profile 查询将与 ingest writer 真正并发，WAL + busy_timeout 是正确性而非润色。
+    let pragmas = store.connection_pragmas().unwrap();
+    assert_eq!(pragmas.journal_mode.to_lowercase(), "wal");
+    assert_eq!(pragmas.busy_timeout, 5000);
+    assert_eq!(pragmas.synchronous, 2); // FULL
+    assert_eq!(pragmas.wal_autocheckpoint, 1000);
 }
 
 #[test]
@@ -600,6 +1366,174 @@ fn retention_failure_diagnostics_do_not_change_success_state() {
         diagnostics.last_error_kind,
         Some("sqlite_retention_failed".to_string())
     );
+}
+
+// 主用例：非 15 分钟对齐的 cutoff，边界桶必须只保留 cutoff 后贡献。
+// 观测布置：边界桶前（完全过期）/ cutoff 前但在边界桶内（应从边界剔除）/ cutoff 后在边界桶内（应保留）/ 远期（不受影响）。
+#[test]
+fn retention_rebuilds_profile_rollup_boundary_keeps_only_post_cutoff() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+
+    // now 故意带 7 分 33 秒，使 cutoff 不落在 15 分钟边界。
+    let now = Utc.with_ymd_and_hms(2026, 6, 26, 12, 7, 33).unwrap();
+    let cutoff = now - chrono::Duration::days(365);
+    assert_ne!(
+        bucket_start_utc(cutoff),
+        cutoff.timestamp(),
+        "cutoff 应非对齐"
+    );
+    let cutoff_bucket = bucket_start_utc(cutoff);
+
+    let expired = Utc.with_ymd_and_hms(2025, 6, 26, 11, 50, 0).unwrap();
+    let pruned = Utc.with_ymd_and_hms(2025, 6, 26, 12, 3, 0).unwrap();
+    let retained = Utc.with_ymd_and_hms(2025, 6, 26, 12, 10, 0).unwrap();
+    let recent = Utc.with_ymd_and_hms(2026, 6, 25, 12, 7, 33).unwrap();
+    let expired_bucket = bucket_start_utc(expired);
+    let recent_bucket = bucket_start_utc(recent);
+
+    insert_tracked(&store, &observation("expired", 1000, expired)).unwrap();
+    insert_tracked(&store, &observation("pruned", 200, pruned)).unwrap();
+    insert_tracked(&store, &observation("retained", 77, retained)).unwrap();
+    insert_tracked(&store, &observation("recent", 5000, recent)).unwrap();
+
+    let outcome = store
+        .run_retention_if_due(now, RetentionPolicy::default())
+        .unwrap();
+
+    // cutoff 前 raw 被删除（expired + pruned）。
+    assert!(outcome.ran);
+    assert_eq!(outcome.deleted_observations, 2);
+    assert_eq!(observation_count(&db_path), 2);
+
+    let rows = rollup_rows(&db_path);
+    // 完全过期 rollup 桶被删除。
+    assert!(
+        rows.iter()
+            .all(|row| row.bucket_start_utc != expired_bucket),
+        "完全过期桶应被删除"
+    );
+    // 远期桶不受影响。
+    let recent_row = rows
+        .iter()
+        .find(|row| row.bucket_start_utc == recent_bucket)
+        .expect("远期桶应保留");
+    assert_eq!(recent_row.total_tokens, 5000);
+
+    // 边界桶只保留 cutoff 后贡献（仅 retained=77）。
+    let boundary = rows
+        .iter()
+        .find(|row| row.bucket_start_utc == cutoff_bucket)
+        .expect("边界桶应存在且已重建");
+    assert_eq!(boundary.source, "traex");
+    assert_eq!(boundary.model, "model-a");
+    assert_eq!(boundary.total_tokens, 77);
+    assert_eq!(boundary.input_tokens, 77);
+    assert_eq!(boundary.billable_uncached_input_tokens, 77);
+    assert_eq!(boundary.output_tokens, 0);
+    assert_eq!(boundary.unattributed_total_tokens, 0);
+    assert_eq!(boundary.observation_count, 1);
+
+    // retention metadata 与 raw/rollup 修改同事务提交。
+    assert_eq!(
+        state_value(&db_path, "last_success_at"),
+        Some(now.to_rfc3339())
+    );
+    // Ready 模式不翻转 state。
+    assert_eq!(rollup_metadata_value(&db_path, "state"), None);
+}
+
+// OVERRIDE D：rollup 边界维护失败时，raw 删除与 last_success_at 仍需持久化，rollup 降级为 invalid。
+#[test]
+fn retention_rebuilds_profile_rollup_boundary_degrades_on_rollup_failure() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+
+    let now = Utc.with_ymd_and_hms(2026, 6, 26, 12, 7, 33).unwrap();
+    let expired = Utc.with_ymd_and_hms(2025, 6, 26, 11, 50, 0).unwrap();
+    let retained = Utc.with_ymd_and_hms(2025, 6, 26, 12, 10, 0).unwrap();
+
+    // 先插入观测让增量 rollup 正常写入，再安装失败触发器只影响 retention 的重建 INSERT。
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_tracked(&store, &observation("expired", 1000, expired)).unwrap();
+    insert_tracked(&store, &observation("retained", 77, retained)).unwrap();
+    drop(store);
+
+    Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            r#"
+            create trigger fail_rollup_boundary_rebuild
+            before insert on usage_rollups_15m
+            begin
+              select raise(fail, 'rollup boundary rebuild failed');
+            end;
+            "#,
+        )
+        .unwrap();
+
+    let mut store = UsageStore::open(&db_path).unwrap();
+    let outcome = store
+        .run_retention_if_due(now, RetentionPolicy::default())
+        .unwrap();
+
+    // raw 删除仍生效（expired 被删，retained 保留），last_success_at 前进，rollup 降级 invalid。
+    assert!(outcome.ran);
+    assert_eq!(outcome.deleted_observations, 1);
+    assert_eq!(observation_count(&db_path), 1);
+    assert_eq!(
+        state_value(&db_path, "last_success_at"),
+        Some(now.to_rfc3339())
+    );
+    assert_eq!(
+        rollup_metadata_value(&db_path, "state"),
+        Some("invalid".to_string())
+    );
+}
+
+// Invalid 模式：Retention 只维护 raw，保持 rollup invalid，不做边界重建。
+#[test]
+fn retention_rebuilds_profile_rollup_boundary_invalid_mode_is_raw_only() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    UsageStore::open(&db_path).unwrap();
+
+    // 预置 state=invalid：后续 tracked insert 走 raw-only 降级，rollup 不写。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "insert into usage_rollup_metadata (key, value) values ('state', 'invalid')",
+            [],
+        )
+        .unwrap();
+
+    let now = Utc.with_ymd_and_hms(2026, 6, 26, 12, 7, 33).unwrap();
+    let expired = Utc.with_ymd_and_hms(2025, 6, 26, 11, 50, 0).unwrap();
+    let retained = Utc.with_ymd_and_hms(2025, 6, 26, 12, 10, 0).unwrap();
+
+    let mut store = UsageStore::open(&db_path).unwrap();
+    insert_tracked(&store, &observation("expired", 1000, expired)).unwrap();
+    insert_tracked(&store, &observation("retained", 77, retained)).unwrap();
+    assert_eq!(rollup_row_count(&db_path), 0, "invalid 模式不写 rollup");
+
+    let outcome = store
+        .run_retention_if_due(now, RetentionPolicy::default())
+        .unwrap();
+
+    // raw 被裁剪，state 保持 invalid，不重建任何 rollup 桶。
+    assert!(outcome.ran);
+    assert_eq!(outcome.deleted_observations, 1);
+    assert_eq!(observation_count(&db_path), 1);
+    assert_eq!(
+        state_value(&db_path, "last_success_at"),
+        Some(now.to_rfc3339())
+    );
+    assert_eq!(
+        rollup_metadata_value(&db_path, "state"),
+        Some("invalid".to_string())
+    );
+    assert_eq!(rollup_row_count(&db_path), 0);
 }
 
 #[test]
@@ -1702,4 +2636,594 @@ fn widget_cost_summary_today_ends_at_now_and_seven_days_is_rolling() {
     assert_eq!(summary.generated_at, now_utc);
     assert_eq!(summary.today.total_tokens, 1_000_000);
     assert_eq!(summary.seven_days.total_tokens, 3_000_000);
+}
+
+// 时区参数化用例：直接用 chrono_tz::Tz 驱动 period_bounds / empty_period_usage_trend，
+// 校验本地日历边界与 DST resolver 在非 Local 时区下的行为。
+#[test]
+fn profile_calendar_tz_kolkata_today_starts_at_local_midnight() {
+    let tz = chrono_tz::Asia::Kolkata;
+    let now_local = tz
+        .with_ymd_and_hms(2026, 7, 8, 12, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+
+    let (start, end) =
+        token_fire::core::profile::period_bounds(ProfilePeriod::Today, now_utc, now_local).unwrap();
+
+    assert_eq!(end, now_utc);
+    // Kolkata 本地 00:00 (+05:30) 对应前一日 18:30 UTC。
+    let expected_start = Utc.with_ymd_and_hms(2026, 7, 7, 18, 30, 0).unwrap();
+    assert_eq!(start, expected_start);
+
+    let start_local = start.with_timezone(&tz);
+    assert_eq!(start_local.date_naive(), now_local.date_naive());
+    assert_eq!(start_local.format("%H:%M:%S").to_string(), "00:00:00");
+    assert_eq!(
+        start_local.offset().fix(),
+        FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap()
+    );
+}
+
+#[test]
+fn profile_calendar_tz_kathmandu_today_bounds_and_trend_use_local_midnight() {
+    let tz = chrono_tz::Asia::Kathmandu;
+    let now_local = tz.with_ymd_and_hms(2026, 7, 8, 9, 15, 0).single().unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+
+    let (start, _end) =
+        token_fire::core::profile::period_bounds(ProfilePeriod::Today, now_utc, now_local).unwrap();
+    // Kathmandu 本地 00:00 (+05:45) 对应前一日 18:15 UTC。
+    let expected_start = Utc.with_ymd_and_hms(2026, 7, 7, 18, 15, 0).unwrap();
+    assert_eq!(start, expected_start);
+
+    let trend = token_fire::core::profile::empty_period_usage_trend(
+        ProfilePeriod::Today,
+        now_utc,
+        now_local,
+    )
+    .unwrap();
+    assert_eq!(trend.buckets.len(), 24);
+    let first = trend.buckets.first().unwrap();
+    assert_eq!(first.started_at, expected_start);
+    let first_local = first.started_at.with_timezone(&tz);
+    assert_eq!(first_local.format("%H:%M:%S").to_string(), "00:00:00");
+    assert_eq!(
+        first_local.offset().fix(),
+        FixedOffset::east_opt(5 * 3600 + 45 * 60).unwrap()
+    );
+}
+
+#[test]
+fn profile_calendar_tz_new_york_spring_forward_gap_resolves_next_valid() {
+    let tz = chrono_tz::America::New_York;
+    // 2026-03-08 是美国夏令时开始日：本地 02:00 -> 03:00 存在缺口。
+    let now_local = tz.with_ymd_and_hms(2026, 3, 8, 12, 0, 0).single().unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+
+    let trend = token_fire::core::profile::empty_period_usage_trend(
+        ProfilePeriod::Today,
+        now_utc,
+        now_local,
+    )
+    .unwrap();
+    assert_eq!(trend.buckets.len(), 24);
+
+    // started_at 单调非递减；缺口小时坍缩到下一有效瞬间，可能与相邻桶相等。
+    for pair in trend.buckets.windows(2) {
+        assert!(
+            pair[1].started_at >= pair[0].started_at,
+            "started_at must be non-decreasing across DST gap"
+        );
+    }
+    // 每个桶区间非负。
+    for bucket in &trend.buckets {
+        assert!(
+            bucket.ended_at >= bucket.started_at,
+            "bucket interval must be non-negative"
+        );
+    }
+
+    // 缺口小时（本地 02:00 不存在）经 resolver 落到下一有效瞬间 = 本地 03:00 EDT = 07:00 UTC。
+    let gap_bucket = trend.buckets.iter().find(|b| b.key == "h02").unwrap();
+    let expected_next_valid = tz
+        .from_local_datetime(
+            &chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
+                .unwrap()
+                .and_hms_opt(3, 0, 0)
+                .unwrap(),
+        )
+        .earliest()
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(gap_bucket.started_at, expected_next_valid);
+    assert_eq!(
+        gap_bucket.started_at,
+        Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).unwrap()
+    );
+}
+
+#[test]
+fn profile_calendar_tz_new_york_fall_back_uses_earliest_instant() {
+    let tz = chrono_tz::America::New_York;
+    // 2026-11-01 是美国夏令时结束日：本地 01:00 出现两次。
+    let now_local = tz.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).single().unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+
+    let trend = token_fire::core::profile::empty_period_usage_trend(
+        ProfilePeriod::Today,
+        now_utc,
+        now_local,
+    )
+    .unwrap();
+    assert_eq!(trend.buckets.len(), 24);
+
+    for pair in trend.buckets.windows(2) {
+        assert!(
+            pair[1].started_at >= pair[0].started_at,
+            "started_at must be non-decreasing across DST fall-back"
+        );
+    }
+
+    // 重复的 01:00 本地时间使用 earliest 瞬间（EDT，-04:00 => 05:00 UTC）。
+    let repeated = trend.buckets.iter().find(|b| b.key == "h01").unwrap();
+    let expected_earliest = tz
+        .from_local_datetime(
+            &chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+                .unwrap()
+                .and_hms_opt(1, 0, 0)
+                .unwrap(),
+        )
+        .earliest()
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(repeated.started_at, expected_earliest);
+    assert_eq!(
+        repeated.started_at,
+        Utc.with_ymd_and_hms(2026, 11, 1, 5, 0, 0).unwrap()
+    );
+}
+
+#[test]
+fn profile_calendar_tz_kolkata_week_month_year_start_at_local_midnight() {
+    let tz = chrono_tz::Asia::Kolkata;
+    // 2026-07-08 是周三。
+    let now_local = tz.with_ymd_and_hms(2026, 7, 8, 12, 0, 0).single().unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+
+    let (week_start, _) =
+        token_fire::core::profile::period_bounds(ProfilePeriod::ThisWeek, now_utc, now_local)
+            .unwrap();
+    let (month_start, _) =
+        token_fire::core::profile::period_bounds(ProfilePeriod::ThisMonth, now_utc, now_local)
+            .unwrap();
+    let (year_start, _) =
+        token_fire::core::profile::period_bounds(ProfilePeriod::ThisYear, now_utc, now_local)
+            .unwrap();
+
+    let week_local = week_start.with_timezone(&tz);
+    assert_eq!(week_local.weekday(), chrono::Weekday::Mon);
+    assert_eq!(week_local.format("%H:%M:%S").to_string(), "00:00:00");
+    let expected_monday = Utc.with_ymd_and_hms(2026, 7, 5, 18, 30, 0).unwrap();
+    assert_eq!(week_start, expected_monday);
+
+    let month_local = month_start.with_timezone(&tz);
+    assert_eq!(
+        (month_local.year(), month_local.month(), month_local.day()),
+        (2026, 7, 1)
+    );
+    assert_eq!(month_local.format("%H:%M:%S").to_string(), "00:00:00");
+
+    let year_local = year_start.with_timezone(&tz);
+    assert_eq!(
+        (year_local.year(), year_local.month(), year_local.day()),
+        (2026, 1, 1)
+    );
+    assert_eq!(year_local.format("%H:%M:%S").to_string(), "00:00:00");
+    let expected_year = Utc.with_ymd_and_hms(2025, 12, 31, 18, 30, 0).unwrap();
+    assert_eq!(year_start, expected_year);
+}
+
+// ---- Task 6B: rollup 查询与 raw 完整等价性矩阵 -----------------------------------
+
+/// 插入一条 tracked 观测，可指定 source/model/分量，用于 rollup parity 夹具。
+fn seed_obs(
+    store: &UsageStore,
+    id: &str,
+    source: &str,
+    model: Option<&str>,
+    input: i64,
+    output: i64,
+    cached: i64,
+    cache_creation: i64,
+    reasoning: i64,
+    total: i64,
+    observed_at: chrono::DateTime<Utc>,
+) {
+    let mut row = cost_observation(
+        id,
+        model,
+        input,
+        output,
+        cached,
+        cache_creation,
+        reasoning,
+        total,
+        observed_at,
+    );
+    row.source = source.to_string();
+    insert_tracked(store, &row).unwrap();
+}
+
+/// 铺开覆盖 today / week / month / year / 热力图的混合观测：分量型、total-only(unattributed)、
+/// unknown model、cached clamp、同桶多条(桶内合并)、首尾部分桶、future(应被排除)。
+fn seed_parity_fixture(store: &UsageStore, now_utc: chrono::DateTime<Utc>) {
+    // 尾部部分桶 [floor(now,900), now)：分量型，gpt-5.5 / traex。
+    seed_obs(
+        store,
+        "p-tail",
+        "traex",
+        Some("gpt-5.5"),
+        1_000_000,
+        500_000,
+        250_000,
+        100_000,
+        50_000,
+        1_900_000,
+        now_utc - chrono::Duration::minutes(3),
+    );
+    // 今日完整桶：同桶两条 total-only(unattributed)，None model / codex，验证桶内合并。
+    seed_obs(
+        store,
+        "p-today-a",
+        "codex",
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        2_000_000,
+        now_utc - chrono::Duration::minutes(37),
+    );
+    seed_obs(
+        store,
+        "p-today-b",
+        "codex",
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        3_000_000,
+        now_utc - chrono::Duration::minutes(37) + chrono::Duration::seconds(45),
+    );
+    // 今日：cached/creation clamp 边界(input<cached+creation → billable 0)，claude / claude。
+    seed_obs(
+        store,
+        "p-clamp",
+        "claude",
+        Some("claude-sonnet-5"),
+        10,
+        0,
+        8,
+        7,
+        0,
+        25,
+        now_utc - chrono::Duration::hours(2),
+    );
+    // 昨日(本周/本月/本年)：unknown model / cursor → pricing fallback。
+    seed_obs(
+        store,
+        "p-yesterday",
+        "cursor",
+        Some("totally-unknown-model"),
+        400_000,
+        200_000,
+        0,
+        0,
+        0,
+        600_000,
+        now_utc - chrono::Duration::hours(30),
+    );
+    // 本月早些：分量型 gpt-4o / traex。
+    seed_obs(
+        store,
+        "p-month",
+        "traex",
+        Some("gpt-4o"),
+        800_000,
+        300_000,
+        100_000,
+        0,
+        0,
+        1_100_000,
+        now_utc - chrono::Duration::days(10),
+    );
+    // 本年更早月份：分量型。
+    seed_obs(
+        store,
+        "p-year-1",
+        "codex",
+        Some("gpt-5.5"),
+        500_000,
+        250_000,
+        0,
+        0,
+        20_000,
+        770_000,
+        now_utc - chrono::Duration::days(60),
+    );
+    // 本年更早：total-only。
+    seed_obs(
+        store,
+        "p-year-2",
+        "traex",
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        900_000,
+        now_utc - chrono::Duration::days(200),
+    );
+    // future 观测(now+10min)：raw 与 rollup 都必须排除。
+    seed_obs(
+        store,
+        "p-future",
+        "traex",
+        Some("gpt-5.5"),
+        100_000,
+        0,
+        0,
+        0,
+        0,
+        100_000,
+        now_utc + chrono::Duration::minutes(10),
+    );
+}
+
+/// 对给定 period/时区：先取 raw 参考，rebuild 到 ready，再取 rollup 路径，断言来源为 Rollup
+/// 且完整 ProfileSummary 精确等价。
+fn assert_rollup_matches_raw_for_tz<Tz>(
+    store: &mut UsageStore,
+    period: ProfilePeriod,
+    now_utc: chrono::DateTime<Utc>,
+    now_local: chrono::DateTime<Tz>,
+) where
+    Tz: TimeZone + Copy,
+    Tz::Offset: std::fmt::Display,
+{
+    let raw = store
+        .profile_summary_raw_at_in_timezone(period, now_utc, now_local.clone())
+        .unwrap();
+    let ensure = store.ensure_profile_rollup_ready().unwrap();
+    assert!(ensure.rollup_row_count > 0, "rebuild 应产生 rollup 行");
+    let outcome = store
+        .profile_summary_with_diagnostics_at_in_timezone(period, now_utc, now_local)
+        .unwrap();
+    assert_eq!(
+        outcome.source,
+        ProfileQuerySource::Rollup,
+        "ready 时应走 rollup 路径 (period={period:?})"
+    );
+    assert_profile_summary_close(&outcome.summary, &raw);
+}
+
+fn parity_store() -> (tempfile::TempDir, UsageStore) {
+    let dir = tempdir().unwrap();
+    let store = UsageStore::open(&dir.path().join("token-fire.sqlite")).unwrap();
+    (dir, store)
+}
+
+#[test]
+fn profile_rollup_matches_raw_kolkata_all_periods() {
+    let tz = chrono_tz::Asia::Kolkata;
+    // now 带非对齐的分/秒，制造尾部部分桶。
+    let now_local = tz
+        .with_ymd_and_hms(2026, 7, 8, 14, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let (_dir, mut store) = parity_store();
+    seed_parity_fixture(&store, now_utc);
+    for period in [
+        ProfilePeriod::Today,
+        ProfilePeriod::ThisWeek,
+        ProfilePeriod::ThisMonth,
+        ProfilePeriod::ThisYear,
+    ] {
+        assert_rollup_matches_raw_for_tz(&mut store, period, now_utc, now_local);
+    }
+}
+
+#[test]
+fn profile_rollup_matches_raw_kathmandu_all_periods() {
+    let tz = chrono_tz::Asia::Kathmandu;
+    let now_local = tz.with_ymd_and_hms(2026, 7, 8, 9, 22, 13).single().unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let (_dir, mut store) = parity_store();
+    seed_parity_fixture(&store, now_utc);
+    for period in [
+        ProfilePeriod::Today,
+        ProfilePeriod::ThisWeek,
+        ProfilePeriod::ThisMonth,
+        ProfilePeriod::ThisYear,
+    ] {
+        assert_rollup_matches_raw_for_tz(&mut store, period, now_utc, now_local);
+    }
+}
+
+#[test]
+fn profile_rollup_matches_raw_new_york_spring_forward_day() {
+    let tz = chrono_tz::America::New_York;
+    // 2026-03-08 是美东春季跳时日(02:00→03:00)；now 落在跳时之后。
+    let now_local = tz
+        .with_ymd_and_hms(2026, 3, 8, 14, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let (_dir, mut store) = parity_store();
+    seed_parity_fixture(&store, now_utc);
+    for period in [
+        ProfilePeriod::Today,
+        ProfilePeriod::ThisWeek,
+        ProfilePeriod::ThisMonth,
+        ProfilePeriod::ThisYear,
+    ] {
+        assert_rollup_matches_raw_for_tz(&mut store, period, now_utc, now_local);
+    }
+}
+
+#[test]
+fn profile_rollup_matches_raw_new_york_fall_back_day() {
+    let tz = chrono_tz::America::New_York;
+    // 2026-11-01 是美东秋季回拨日(01:00 出现两次)；now 落在回拨之后。
+    let now_local = tz
+        .with_ymd_and_hms(2026, 11, 1, 14, 7, 33)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let (_dir, mut store) = parity_store();
+    seed_parity_fixture(&store, now_utc);
+    for period in [
+        ProfilePeriod::Today,
+        ProfilePeriod::ThisWeek,
+        ProfilePeriod::ThisMonth,
+        ProfilePeriod::ThisYear,
+    ] {
+        assert_rollup_matches_raw_for_tz(&mut store, period, now_utc, now_local);
+    }
+}
+
+#[test]
+fn profile_rollup_matches_raw_excludes_future_and_merges_partial_edges() {
+    // 显式验证：尾部部分桶 + 完整桶不重复计数，future 被排除，桶内多条合并。
+    let tz = chrono_tz::Asia::Kolkata;
+    let now_local = tz
+        .with_ymd_and_hms(2026, 7, 8, 14, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let (_dir, mut store) = parity_store();
+    seed_parity_fixture(&store, now_utc);
+
+    let raw = store
+        .profile_summary_raw_at_in_timezone(ProfilePeriod::Today, now_utc, now_local)
+        .unwrap();
+    store.ensure_profile_rollup_ready().unwrap();
+    let outcome = store
+        .profile_summary_with_diagnostics_at_in_timezone(ProfilePeriod::Today, now_utc, now_local)
+        .unwrap();
+
+    assert_eq!(outcome.source, ProfileQuerySource::Rollup);
+    // 今日总量 = tail(1.9M) + 两条 total-only(2M+3M) + clamp(25)；future(100k) 排除。
+    assert_eq!(
+        outcome.summary.selected_period.total_tokens,
+        1_900_000 + 2_000_000 + 3_000_000 + 25
+    );
+    assert_eq!(
+        outcome.summary.selected_period.total_tokens,
+        raw.selected_period.total_tokens
+    );
+    assert_profile_summary_close(&outcome.summary, &raw);
+}
+
+#[test]
+fn profile_rollup_falls_back_to_raw_when_state_not_ready() {
+    let tz = chrono_tz::Asia::Kolkata;
+    let now_local = tz
+        .with_ymd_and_hms(2026, 7, 8, 14, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let (_dir, store) = parity_store();
+    seed_parity_fixture(&store, now_utc);
+    // 从未 ensure_ready：state 缺失 → 查询整体回退 raw，但结果与 raw 参考一致。
+    let raw = store
+        .profile_summary_raw_at_in_timezone(ProfilePeriod::ThisWeek, now_utc, now_local)
+        .unwrap();
+    let outcome = store
+        .profile_summary_with_diagnostics_at_in_timezone(
+            ProfilePeriod::ThisWeek,
+            now_utc,
+            now_local,
+        )
+        .unwrap();
+    assert_eq!(outcome.source, ProfileQuerySource::RawFallback);
+    assert_eq!(outcome.rollup_schema_version, None);
+    assert_profile_summary_close(&outcome.summary, &raw);
+}
+
+#[test]
+fn profile_rollup_falls_back_to_raw_on_version_mismatch() {
+    let tz = chrono_tz::Asia::Kolkata;
+    let now_local = tz
+        .with_ymd_and_hms(2026, 7, 8, 14, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    seed_parity_fixture(&store, now_utc);
+    store.ensure_profile_rollup_ready().unwrap();
+    let raw = store
+        .profile_summary_raw_at_in_timezone(ProfilePeriod::ThisMonth, now_utc, now_local)
+        .unwrap();
+    // 篡改 schema_version 为未来版本：查询只读该 metadata 即判定不就绪 → 回退。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "update usage_rollup_metadata set value = '999' where key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+    let store = UsageStore::open(&db_path).unwrap();
+    let outcome = store
+        .profile_summary_with_diagnostics_at_in_timezone(
+            ProfilePeriod::ThisMonth,
+            now_utc,
+            now_local,
+        )
+        .unwrap();
+    assert_eq!(outcome.source, ProfileQuerySource::RawFallback);
+    assert_profile_summary_close(&outcome.summary, &raw);
+}
+
+#[test]
+fn profile_rollup_falls_back_to_raw_when_rollup_query_fails() {
+    let tz = chrono_tz::Asia::Kolkata;
+    let now_local = tz
+        .with_ymd_and_hms(2026, 7, 8, 14, 34, 56)
+        .single()
+        .unwrap();
+    let now_utc = now_local.with_timezone(&Utc);
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("token-fire.sqlite");
+    let mut store = UsageStore::open(&db_path).unwrap();
+    seed_parity_fixture(&store, now_utc);
+    store.ensure_profile_rollup_ready().unwrap();
+    let raw = store
+        .profile_summary_raw_at_in_timezone(ProfilePeriod::ThisYear, now_utc, now_local)
+        .unwrap();
+    // state 仍为 ready，但用另一连接 drop rollup 表使 store 的 SELECT 失败（结构性错误）。
+    // 不重新 open store（否则 migration 会重建空表）；就绪门只读 metadata 仍判定 ready，
+    // 随后 rollup 读取报 "no such table" → aggregates_for_range 出错 → 整体回退 raw，不返回部分数据。
+    Connection::open(&db_path)
+        .unwrap()
+        .execute_batch("drop table usage_rollups_15m;")
+        .unwrap();
+    let outcome = store
+        .profile_summary_with_diagnostics_at_in_timezone(
+            ProfilePeriod::ThisYear,
+            now_utc,
+            now_local,
+        )
+        .unwrap();
+    assert_eq!(outcome.source, ProfileQuerySource::RawFallback);
+    assert_profile_summary_close(&outcome.summary, &raw);
 }

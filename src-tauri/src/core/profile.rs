@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Days, Local, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Days, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,25 +113,38 @@ pub struct PeriodUsageTrendTick {
     pub label: String,
 }
 
-fn local_midnight_utc(date: NaiveDate) -> anyhow::Result<DateTime<Utc>> {
+// 本地午夜转 UTC：使用调用方传入的时区（来自 now_local.timezone()），
+// 而非系统 Local，确保所有日历边界与 now_local 处于同一时区。
+fn local_midnight_utc<Tz>(tz: Tz, date: NaiveDate) -> anyhow::Result<DateTime<Utc>>
+where
+    Tz: TimeZone + Copy,
+    Tz::Offset: std::fmt::Display,
+{
     let midnight = date
         .and_hms_opt(0, 0, 0)
         .ok_or_else(|| anyhow::anyhow!("invalid local midnight date: {date}"))?;
-    let local = Local
+    let local = tz
         .from_local_datetime(&midnight)
         .single()
         .ok_or_else(|| anyhow::anyhow!("ambiguous or invalid local midnight: {date}"))?;
     Ok(local.with_timezone(&Utc))
 }
 
-fn local_datetime_utc(date: NaiveDate, hour: u32) -> anyhow::Result<DateTime<Utc>> {
+// 指定本地日期+整点小时转 UTC，附带 DST resolver：
+// Single -> 值；Ambiguous(earliest, _) -> earliest（重复小时取最早瞬间）；
+// None（缺口/不存在的本地时间）-> 加 1 小时后取 earliest，落到下一个有效瞬间。
+fn local_datetime_utc<Tz>(tz: Tz, date: NaiveDate, hour: u32) -> anyhow::Result<DateTime<Utc>>
+where
+    Tz: TimeZone + Copy,
+    Tz::Offset: std::fmt::Display,
+{
     let local_time = date
         .and_hms_opt(hour, 0, 0)
         .ok_or_else(|| anyhow::anyhow!("invalid local datetime: {date} {hour}:00:00"))?;
-    let local = match Local.from_local_datetime(&local_time) {
+    let local = match tz.from_local_datetime(&local_time) {
         chrono::LocalResult::Single(value) => value,
         chrono::LocalResult::Ambiguous(earliest, _) => earliest,
-        chrono::LocalResult::None => Local
+        chrono::LocalResult::None => tz
             .from_local_datetime(&(local_time + chrono::Duration::hours(1)))
             .earliest()
             .ok_or_else(|| {
@@ -160,41 +173,53 @@ fn last_day_of_month(year: i32, month: u32) -> anyhow::Result<NaiveDate> {
         .ok_or_else(|| anyhow::anyhow!("invalid last day of month: {year}-{month}"))
 }
 
-pub fn period_bounds(
+pub fn period_bounds<Tz>(
     period: ProfilePeriod,
     now_utc: DateTime<Utc>,
-    now_local: DateTime<Local>,
-) -> anyhow::Result<(DateTime<Utc>, DateTime<Utc>)> {
+    now_local: DateTime<Tz>,
+) -> anyhow::Result<(DateTime<Utc>, DateTime<Utc>)>
+where
+    Tz: TimeZone + Copy,
+    Tz::Offset: std::fmt::Display,
+{
+    // 从 now_local 提取时区，所有本地边界统一用它构造（不使用系统 Local）。
+    let tz = now_local.timezone();
     let end = now_utc;
     let start = match period {
-        ProfilePeriod::Today => local_midnight_utc(now_local.date_naive())?,
+        ProfilePeriod::Today => local_midnight_utc(tz, now_local.date_naive())?,
         ProfilePeriod::ThisWeek => {
             let days_from_monday = now_local.weekday().num_days_from_monday() as u64;
             let start_date = now_local
                 .date_naive()
                 .checked_sub_days(Days::new(days_from_monday))
                 .ok_or_else(|| anyhow::anyhow!("invalid local week start"))?;
-            local_midnight_utc(start_date)?
+            local_midnight_utc(tz, start_date)?
         }
         ProfilePeriod::ThisMonth => {
             let start_date = NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), 1)
                 .ok_or_else(|| anyhow::anyhow!("invalid local month start"))?;
-            local_midnight_utc(start_date)?
+            local_midnight_utc(tz, start_date)?
         }
         ProfilePeriod::ThisYear => {
             let start_date = NaiveDate::from_ymd_opt(now_local.year(), 1, 1)
                 .ok_or_else(|| anyhow::anyhow!("invalid local year start"))?;
-            local_midnight_utc(start_date)?
+            local_midnight_utc(tz, start_date)?
         }
     };
     Ok((start, end))
 }
 
-pub fn empty_period_usage_trend(
+pub fn empty_period_usage_trend<Tz>(
     period: ProfilePeriod,
     now_utc: DateTime<Utc>,
-    now_local: DateTime<Local>,
-) -> anyhow::Result<PeriodUsageTrend> {
+    now_local: DateTime<Tz>,
+) -> anyhow::Result<PeriodUsageTrend>
+where
+    Tz: TimeZone + Copy,
+    Tz::Offset: std::fmt::Display,
+{
+    // 从 now_local 提取时区，所有小时/日/月桶边界统一用它构造。
+    let tz = now_local.timezone();
     let mut buckets = Vec::new();
     let mut x_ticks = Vec::new();
 
@@ -202,11 +227,11 @@ pub fn empty_period_usage_trend(
         ProfilePeriod::Today => {
             let local_date = now_local.date_naive();
             for hour in 0..24_u32 {
-                let started_at = local_datetime_utc(local_date, hour)?;
+                let started_at = local_datetime_utc(tz, local_date, hour)?;
                 let ended_at = if hour == 23 {
-                    local_midnight_utc(local_date + Days::new(1))?
+                    local_midnight_utc(tz, local_date + Days::new(1))?
                 } else {
-                    local_datetime_utc(local_date, hour + 1)?
+                    local_datetime_utc(tz, local_date, hour + 1)?
                 };
                 let is_future = started_at > now_utc;
                 let key = format!("h{hour:02}");
@@ -240,8 +265,8 @@ pub fn empty_period_usage_trend(
             let labels = ["一", "二", "三", "四", "五", "六", "日"];
             for day_index in 0..7_usize {
                 let local_date = monday + Days::new(day_index as u64);
-                let started_at = local_midnight_utc(local_date)?;
-                let ended_at = local_midnight_utc(local_date + Days::new(1))?;
+                let started_at = local_midnight_utc(tz, local_date)?;
+                let ended_at = local_midnight_utc(tz, local_date + Days::new(1))?;
                 let is_future = started_at > now_utc;
                 let key = format!("d{day_index}");
                 x_ticks.push(PeriodUsageTrendTick {
@@ -272,8 +297,8 @@ pub fn empty_period_usage_trend(
             let month_len = last_day.day();
             for day in 1..=month_len {
                 let local_date = first_day + Days::new((day - 1) as u64);
-                let started_at = local_midnight_utc(local_date)?;
-                let ended_at = local_midnight_utc(local_date + Days::new(1))?;
+                let started_at = local_midnight_utc(tz, local_date)?;
+                let ended_at = local_midnight_utc(tz, local_date + Days::new(1))?;
                 let is_future = started_at > now_utc;
                 let key = format!("d{day:02}");
                 if day == 1 || day == 10 || day == 20 || day == month_len {
@@ -309,8 +334,8 @@ pub fn empty_period_usage_trend(
             for month in 1..=12_u32 {
                 let local_date = NaiveDate::from_ymd_opt(year, month, 1)
                     .ok_or_else(|| anyhow::anyhow!("invalid local month bucket"))?;
-                let started_at = local_midnight_utc(local_date)?;
-                let ended_at = local_midnight_utc(next_month_start(year, month)?)?;
+                let started_at = local_midnight_utc(tz, local_date)?;
+                let ended_at = local_midnight_utc(tz, next_month_start(year, month)?)?;
                 let is_future = started_at > now_utc;
                 let key = format!("m{month:02}");
                 if matches!(month, 1 | 4 | 7 | 10 | 12) {

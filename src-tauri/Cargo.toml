@@ -42,5 +42,6 @@ walkdir = "2"
 
 [dev-dependencies]
 assert_cmd = "2"
+chrono-tz = "0.10"
 predicates = "3"
 tempfile = "3"

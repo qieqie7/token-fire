@@ -1367,3 +1367,171 @@ fn hook_source_parser_never_defaults_unknown_source_to_traex() {
     );
     assert_eq!(token_fire::app::runtime::parse_hook_source(None), None);
 }
+
+fn find_db_log_event(db_log: &str, event: &str) -> Value {
+    db_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|value| value["event"] == event)
+        .unwrap_or_else(|| panic!("expected {event} db log"))
+}
+
+fn rollup_metadata_value(db_path: &Path, key: &str) -> Option<String> {
+    rusqlite::Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            "select value from usage_rollup_metadata where key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+/// 造一个已增量写入 rollup 但从未翻转 state/version 的库（模拟正常 ingest 后首次启动）。
+fn seed_tracked_rollup_db(db_path: &Path) {
+    let store = UsageStore::open(db_path).unwrap();
+    let observed_at = Utc::now() - chrono::Duration::minutes(5);
+    let window_id = store
+        .open_tracking_window(observed_at - chrono::Duration::minutes(1))
+        .unwrap();
+    store
+        .insert_observation_for_tracking_window(
+            &runtime_observation("startup-rollup-seed", 1234, observed_at),
+            window_id,
+        )
+        .unwrap();
+}
+
+#[test]
+fn startup_profile_rollup_rebuilds_and_logs_status_when_state_missing() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path());
+    fs::create_dir_all(&paths.run_dir).unwrap();
+    let sessions_dir = dir.path().join("sessions");
+    let archived_sessions_dir = dir.path().join("archived_sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::create_dir_all(&archived_sessions_dir).unwrap();
+    seed_tracked_rollup_db(&paths.database);
+
+    let runtime = AppRuntime::start(
+        paths.clone(),
+        TraexPaths {
+            sessions_dir,
+            archived_sessions_dir,
+        },
+        TrackingGate::new(),
+        DebugLogGate::default(),
+    )
+    .unwrap();
+
+    // 启动维护把 rollup 翻转 ready + 写 schema_version。
+    assert_eq!(
+        rollup_metadata_value(&paths.database, "state"),
+        Some("ready".to_string())
+    );
+    assert_eq!(
+        rollup_metadata_value(&paths.database, "schema_version"),
+        Some("1".to_string())
+    );
+
+    let db_log = fs::read_to_string(&paths.db_log).unwrap();
+    let event = find_db_log_event(&db_log, "rollup_rebuild_status");
+    assert_eq!(event["rollup_rebuild_status"], "rebuilt");
+    assert_eq!(event["rollup_schema_version"], "1");
+    assert_eq!(event["rollup_row_count"], 1);
+    assert!(event["rollup_rebuild_duration_ms"].is_number());
+
+    // 诊断日志只含 duration/status/version/row-count，绝不含 model/source path/session id。
+    let object = event.as_object().unwrap();
+    assert!(!object.contains_key("model"));
+    assert!(!object.contains_key("source"));
+    assert!(!object.contains_key("source_path"));
+    assert!(!object.contains_key("session_id"));
+    drop(runtime);
+}
+
+#[test]
+fn startup_profile_rollup_ready_does_not_rebuild_again() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path());
+    fs::create_dir_all(&paths.run_dir).unwrap();
+    let sessions_dir = dir.path().join("sessions");
+    let archived_sessions_dir = dir.path().join("archived_sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::create_dir_all(&archived_sessions_dir).unwrap();
+    seed_tracked_rollup_db(&paths.database);
+    let traex_paths = TraexPaths {
+        sessions_dir,
+        archived_sessions_dir,
+    };
+
+    // 首次启动：state 缺失 → rebuild。
+    let runtime = AppRuntime::start(
+        paths.clone(),
+        traex_paths.clone(),
+        TrackingGate::new(),
+        DebugLogGate::default(),
+    )
+    .unwrap();
+    drop(runtime);
+    fs::remove_file(&paths.db_log).ok();
+
+    // 第二次启动：已 Ready → 只校验不重建。
+    let runtime = AppRuntime::start(
+        paths.clone(),
+        traex_paths,
+        TrackingGate::new(),
+        DebugLogGate::default(),
+    )
+    .unwrap();
+
+    let db_log = fs::read_to_string(&paths.db_log).unwrap();
+    let event = find_db_log_event(&db_log, "rollup_rebuild_status");
+    assert_eq!(event["rollup_rebuild_status"], "ready");
+    assert_eq!(event["rollup_schema_version"], "1");
+    drop(runtime);
+}
+
+#[test]
+fn startup_profile_rollup_failure_logs_and_does_not_block_runtime() {
+    let dir = tempdir().unwrap();
+    let paths = paths(dir.path());
+    fs::create_dir_all(&paths.run_dir).unwrap();
+    let sessions_dir = dir.path().join("sessions");
+    let archived_sessions_dir = dir.path().join("archived_sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::create_dir_all(&archived_sessions_dir).unwrap();
+    seed_tracked_rollup_db(&paths.database);
+
+    // 用同名 index 占用 shadow 表名：rebuild 的 create table usage_rollups_15m_rebuild 必失败。
+    rusqlite::Connection::open(&paths.database)
+        .unwrap()
+        .execute(
+            "create index usage_rollups_15m_rebuild on usage_rollups_15m(source)",
+            [],
+        )
+        .unwrap();
+
+    // rebuild 失败不返回启动错误：runtime 仍返回 Some(AppRuntime)。
+    let runtime = AppRuntime::start(
+        paths.clone(),
+        TraexPaths {
+            sessions_dir,
+            archived_sessions_dir,
+        },
+        TrackingGate::new(),
+        DebugLogGate::default(),
+    )
+    .unwrap();
+
+    let db_log = fs::read_to_string(&paths.db_log).unwrap();
+    let event = find_db_log_event(&db_log, "rollup_rebuild_status");
+    assert_eq!(event["rollup_rebuild_status"], "failed");
+    assert!(event["error_kind"].is_string());
+    // 失败后 rollup 未 ready，Profile 后续可走 raw fallback（Task 6）。
+    assert_ne!(
+        rollup_metadata_value(&paths.database, "state"),
+        Some("ready".to_string())
+    );
+    drop(runtime);
+}

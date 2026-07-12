@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::time::Instant;
 
 use tauri::Manager;
 use tauri::State;
@@ -14,6 +15,7 @@ use token_fire::app::build_identity::{
 };
 use token_fire::app::logging::{DebugLogGate, RuntimeLogSinks};
 use token_fire::app::paths::runtime_paths;
+use token_fire::app::profile_query::{log_profile_query_result, query_profile_summary};
 use token_fire::app::release_check::{
     open_release_url, start_release_check_on_startup, trusted_release_url_for_status,
     GithubReleaseHttpClient, ReleaseCheckStore, ReleaseUpdateStateStore, ReleaseUpdateStatus,
@@ -27,14 +29,19 @@ use token_fire::app::widget_events::{emit_usage_fact_invalidation_events, Widget
 use token_fire::core::profile::{ProfilePeriod, ProfileSummary};
 
 #[tauri::command]
-fn profile_summary(
+async fn profile_summary(
     period: ProfilePeriod,
     state: State<'_, AppState>,
 ) -> Result<ProfileSummary, String> {
-    let now_utc = chrono::Utc::now();
-    let now_local = now_utc.with_timezone(&chrono::Local);
-    state
-        .profile_summary_at(period, now_utc, now_local)
+    // 只从 State 提取 owned context（path + 日志 sink），借用在首次 .await 前结束；
+    // SQLite open/查询/定价整体在 spawn_blocking 里执行，离开 Tauri 主线程。
+    let database = state.profile_database_path();
+    let log_sinks = state.profile_log_sinks();
+    let started = Instant::now();
+    let result = query_profile_summary(database, period, chrono::Utc::now()).await;
+    log_profile_query_result(&log_sinks, started.elapsed(), &result);
+    result
+        .map(|outcome| outcome.summary)
         .map_err(|error| error.to_string())
 }
 

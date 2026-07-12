@@ -17,6 +17,10 @@ use crate::core::profile::{
     PeriodProfileSummary, ProfileCostDrivers, ProfileDayBucket, ProfilePeakDay, ProfilePeriod,
     ProfileSummary, RankedProfileBreakdown, YearProfileSummary,
 };
+use crate::core::profile_rollup::{
+    bucket_start_utc, normalize_model_key, PROFILE_ROLLUP_BUCKET_SECONDS,
+    PROFILE_ROLLUP_SCHEMA_VERSION,
+};
 use crate::core::usage_series::{
     average_tokens_per_bucket, bucket_index_for, empty_usage_buckets, WidgetUsageSeries,
     WIDGET_USAGE_ACTIVE_THRESHOLD_MINUTES, WIDGET_USAGE_WINDOW_MINUTES,
@@ -37,6 +41,15 @@ pub struct TrackingWindow {
 
 pub const DEFAULT_RETENTION_DAYS: i64 = 365;
 pub const DEFAULT_RETENTION_MIN_INTERVAL_HOURS: i64 = 24;
+
+/// rollup readiness 状态机的 metadata key 与取值。migration 不预写这些；
+/// 完整 rebuild + 翻转 ready + 写 schema_version 由 Task 5 拥有。
+const ROLLUP_METADATA_STATE_KEY: &str = "state";
+const ROLLUP_METADATA_SCHEMA_VERSION_KEY: &str = "schema_version";
+const ROLLUP_STATE_INVALID: &str = "invalid";
+const ROLLUP_STATE_READY: &str = "ready";
+/// rebuild 用的 shadow 表名；rebuild 结束后 rename 为正式表，任何残留在 rebuild 起始处清理。
+const ROLLUP_SHADOW_TABLE: &str = "usage_rollups_15m_rebuild";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
@@ -76,8 +89,50 @@ pub struct RetentionDiagnostics {
     pub last_error_kind: Option<String>,
 }
 
+/// Profile rollup 读模型的就绪状态。
+/// `Ready` 表示可直接读 rollup；`RebuildRequired` 携带稳定 reason 字符串供诊断日志分类。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileRollupStatus {
+    Ready { schema_version: String },
+    RebuildRequired { reason: &'static str },
+}
+
+/// rebuild / ensure 的结果：是否真正重建、当前 rollup 行数、写入的 schema_version。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileRollupRebuildOutcome {
+    pub rebuilt: bool,
+    pub rollup_row_count: usize,
+    pub schema_version: String,
+}
+
+/// 一次 Profile 查询实际走的路径：Rollup（完整桶 + 首尾 raw 部分桶）或 RawFallback（整体回退）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileQuerySource {
+    Rollup,
+    RawFallback,
+}
+
+/// Profile 查询结果 + 诊断信息（供 App 层记录 profile_query_source / rollup_row_count 等）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileQueryOutcome {
+    pub summary: ProfileSummary,
+    pub source: ProfileQuerySource,
+    pub rollup_row_count: usize,
+    pub rollup_schema_version: Option<String>,
+}
+
 pub struct UsageStore {
     conn: Connection,
+}
+
+/// 只读诊断快照：暴露每个 connection 显式设置的 SQLite PRAGMA，供并发正确性验证与诊断日志使用。
+/// 不含数据库路径或业务数据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionPragmas {
+    pub journal_mode: String,
+    pub synchronous: i64,
+    pub busy_timeout: i64,
+    pub wal_autocheckpoint: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -110,8 +165,53 @@ impl UsageStore {
         }
         let conn = Connection::open(path)?;
         let store = Self { conn };
+        store.apply_connection_policy()?;
         store.migrate()?;
         Ok(store)
+    }
+
+    /// 显式设置每个 connection 的 SQLite 策略（OVERRIDE C / spec "SQLite Connection Policy"）。
+    /// 单 writer 多 reader：WAL 让 Profile reader 与 ingest writer 并发；synchronous=FULL 保持
+    /// 与旧默认相当的 durability，不以耐久性换吞吐；busy_timeout 是并发正确性而非润色。
+    /// journal_mode 是数据库级持久属性，其余为 connection-local，故每次 open 都显式重设。
+    fn apply_connection_policy(&self) -> anyhow::Result<()> {
+        // journal_mode 返回结果集，必须用 query_row 消费；WAL 一经设置持久保存于数据库文件。
+        let mode: String = self
+            .conn
+            .query_row("pragma journal_mode = WAL", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            anyhow::bail!("failed to enable WAL journal mode, got: {mode}");
+        }
+        self.conn.execute_batch(
+            r#"
+            pragma synchronous = FULL;
+            pragma busy_timeout = 5000;
+            pragma wal_autocheckpoint = 1000;
+            "#,
+        )?;
+        Ok(())
+    }
+
+    /// 读取当前 connection 的关键 PRAGMA，用于并发正确性验证与诊断日志。
+    pub fn connection_pragmas(&self) -> anyhow::Result<ConnectionPragmas> {
+        let journal_mode: String = self
+            .conn
+            .query_row("pragma journal_mode", [], |row| row.get(0))?;
+        let synchronous: i64 = self
+            .conn
+            .query_row("pragma synchronous", [], |row| row.get(0))?;
+        let busy_timeout: i64 = self
+            .conn
+            .query_row("pragma busy_timeout", [], |row| row.get(0))?;
+        let wal_autocheckpoint: i64 =
+            self.conn
+                .query_row("pragma wal_autocheckpoint", [], |row| row.get(0))?;
+        Ok(ConnectionPragmas {
+            journal_mode,
+            synchronous,
+            busy_timeout,
+            wal_autocheckpoint,
+        })
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
@@ -163,6 +263,29 @@ impl UsageStore {
               updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );
             create table if not exists retention_state (
+              key text primary key,
+              value text not null
+            );
+            -- 派生读模型：15 分钟 UTC 桶聚合。token/count 字段 CHECK 非负且必须是 integer，
+            -- 避免 SUM 溢出被 SQLite 静默提升为 REAL 后写回。model=NULL 在 key 中规范化为 ''。
+            create table if not exists usage_rollups_15m (
+              bucket_start_utc integer not null,
+              source text not null,
+              model text not null,
+              input_tokens integer not null default 0 check(input_tokens >= 0 and typeof(input_tokens) = 'integer'),
+              billable_uncached_input_tokens integer not null default 0 check(billable_uncached_input_tokens >= 0 and typeof(billable_uncached_input_tokens) = 'integer'),
+              output_tokens integer not null default 0 check(output_tokens >= 0 and typeof(output_tokens) = 'integer'),
+              cached_input_tokens integer not null default 0 check(cached_input_tokens >= 0 and typeof(cached_input_tokens) = 'integer'),
+              cache_creation_input_tokens integer not null default 0 check(cache_creation_input_tokens >= 0 and typeof(cache_creation_input_tokens) = 'integer'),
+              reasoning_output_tokens integer not null default 0 check(reasoning_output_tokens >= 0 and typeof(reasoning_output_tokens) = 'integer'),
+              unattributed_total_tokens integer not null default 0 check(unattributed_total_tokens >= 0 and typeof(unattributed_total_tokens) = 'integer'),
+              total_tokens integer not null default 0 check(total_tokens >= 0 and typeof(total_tokens) = 'integer'),
+              observation_count integer not null default 0 check(observation_count >= 0 and typeof(observation_count) = 'integer'),
+              primary key (bucket_start_utc, source, model)
+            );
+            -- rollup 版本与 ready/invalid 状态元数据。migration 只建表，不预写 schema_version/state；
+            -- 完整 rebuild 并翻转到 ready 由 Task 5 拥有。
+            create table if not exists usage_rollup_metadata (
               key text primary key,
               value text not null
             );
@@ -276,30 +399,58 @@ impl UsageStore {
             }
         }
 
+        // raw 删除用 `?` 传播：raw 是唯一事实源，其删除失败是真实存储故障，必须整体 abort，
+        // 不推进 last_success_at（与 rollup 维护失败的降级路径严格区分）。
+        let deleted_observations = tx.execute(
+            "delete from token_observations where observed_at < ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
+
+        // Ready 模式在同事务内维护 rollup 边界桶；invalid 模式只维护 raw、保持 rollup invalid。
+        if rollup_state(&tx)?.as_deref() != Some(ROLLUP_STATE_INVALID) {
+            // OVERRIDE D：rollup 是派生模型，其边界维护失败不能丢失已删除的 raw retention。
+            // 不用 `?` 传播——捕获错误后回滚组合事务，改走 raw-only 降级并翻转 invalid。
+            if maintain_rollup_boundary(&tx, cutoff).is_err() {
+                drop(tx);
+                return self.run_retention_raw_only_degraded(now, cutoff);
+            }
+        }
+
+        write_retention_metadata(&tx, now, deleted_observations)?;
+        tx.commit()?;
+
+        Ok(RetentionOutcome {
+            ran: true,
+            cutoff,
+            deleted_observations,
+            skipped_reason: None,
+        })
+    }
+
+    /// OVERRIDE D 降级路径：rollup 边界重建失败、组合事务已回滚后调用。
+    /// 新事务只做 raw retention 并把 rollup 标记 invalid（等待 Task 5 完整重建），
+    /// 保证 raw 删除与 last_success_at 仍然持久化；旧 rollup 不再参与查询。
+    fn run_retention_raw_only_degraded(
+        &mut self,
+        now: DateTime<Utc>,
+        cutoff: DateTime<Utc>,
+    ) -> anyhow::Result<RetentionOutcome> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let deleted_observations = tx.execute(
             "delete from token_observations where observed_at < ?1",
             params![cutoff.to_rfc3339()],
         )?;
         tx.execute(
             r#"
-            insert into retention_state (key, value)
-            values ('last_success_at', ?1)
+            insert into usage_rollup_metadata (key, value)
+            values (?1, ?2)
             on conflict(key) do update set value = excluded.value
             "#,
-            params![now.to_rfc3339()],
+            params![ROLLUP_METADATA_STATE_KEY, ROLLUP_STATE_INVALID],
         )?;
-        tx.execute(
-            r#"
-            insert into retention_state (key, value)
-            values ('last_deleted_observations', ?1)
-            on conflict(key) do update set value = excluded.value
-            "#,
-            params![deleted_observations.to_string()],
-        )?;
-        tx.execute(
-            "delete from retention_state where key in ('last_failure_at', 'last_error_kind')",
-            [],
-        )?;
+        write_retention_metadata(&tx, now, deleted_observations)?;
         tx.commit()?;
 
         Ok(RetentionOutcome {
@@ -315,6 +466,169 @@ impl UsageStore {
         observation: &NormalizedObservation,
     ) -> anyhow::Result<InsertOutcome> {
         self.insert_observation_inner(observation, None)
+    }
+
+    /// 启动/rebuild 决策用的 rollup 就绪检查。
+    ///
+    /// 按 spec“App 启动执行 O(1) 状态检查：state=ready 且 version current 直接启动，不扫描 raw”，
+    /// 此处只读 `state` + `schema_version` 两行 metadata，绝不扫描 raw。全局守恒 checksum 属于
+    /// “显式诊断 / 低频 maintenance”，见 `profile_rollup_consistency_audit`，不在正常启动路径执行。
+    /// Ready 需 state==ready 且 schema_version==当前版本；否则返回稳定 reason。
+    pub fn profile_rollup_status(&self) -> anyhow::Result<ProfileRollupStatus> {
+        let state = self.rollup_metadata_value(ROLLUP_METADATA_STATE_KEY)?;
+        match state.as_deref() {
+            None => {
+                return Ok(ProfileRollupStatus::RebuildRequired {
+                    reason: "state_missing",
+                })
+            }
+            Some(ROLLUP_STATE_READY) => {}
+            Some(_) => {
+                // invalid 或任何非 ready 取值都需 rebuild。
+                return Ok(ProfileRollupStatus::RebuildRequired {
+                    reason: "state_invalid",
+                });
+            }
+        }
+
+        let schema_version = self.rollup_metadata_value(ROLLUP_METADATA_SCHEMA_VERSION_KEY)?;
+        if schema_version.as_deref() != Some(PROFILE_ROLLUP_SCHEMA_VERSION) {
+            return Ok(ProfileRollupStatus::RebuildRequired {
+                reason: "version_mismatch",
+            });
+        }
+
+        Ok(ProfileRollupStatus::Ready {
+            schema_version: PROFILE_ROLLUP_SCHEMA_VERSION.to_string(),
+        })
+    }
+
+    /// 显式一致性审计（仅供低频 maintenance / 诊断，不在正常 Ready 启动执行）：
+    /// 扫描 raw 做全局 token/count 守恒 checksum 与 rollup 比对。返回 true 表示守恒通过。
+    ///
+    /// 注意：全局守恒只是诊断，不能替代逐 key 正确性——逐 key 正确性由“增量 upsert、retention
+    /// 边界重建、full rebuild 共用同一分组 + clamp 方言”从构造上保证（rebuild 的 shadow 表即按
+    /// (bucket, source, model) 分组聚合 raw 得到）。若未来支持任意历史修改，应在此扩展逐 key 比对。
+    pub fn profile_rollup_consistency_audit(&self) -> anyhow::Result<bool> {
+        Ok(self.rollup_conservation_totals()? == self.raw_conservation_totals()?)
+    }
+
+    /// 启动维护入口：Ready 直接返回 rebuilt:false（不重复重建）；否则触发原子 rebuild。
+    pub fn ensure_profile_rollup_ready(&mut self) -> anyhow::Result<ProfileRollupRebuildOutcome> {
+        if let ProfileRollupStatus::Ready { schema_version } = self.profile_rollup_status()? {
+            return Ok(ProfileRollupRebuildOutcome {
+                rebuilt: false,
+                rollup_row_count: self.rollup_row_count()? as usize,
+                schema_version,
+            });
+        }
+        self.rebuild_profile_rollups()
+    }
+
+    /// 用 shadow table 原子重建整张 rollup：从 raw 全量聚合 → 校验守恒 → drop+rename 换表。
+    ///
+    /// 两段事务，保证“崩溃只剩完整旧状态或完整新状态”：
+    /// 1) 先在独立事务持久化 state=invalid（rebuild 进行中标记）。若中途崩溃 reopen 后仍是
+    ///    invalid，增量双写停用、等待再次 rebuild，不会看到半成品 ready。
+    /// 2) rebuild body 在单个 Immediate 事务内完成 shadow 建表/聚合/校验/drop/rename/写 ready+
+    ///    version；任一步失败 → 事务 drop 回滚 → 正式表与旧 version 完全不变，state 停留 invalid。
+    ///    换表（drop 正式表 + rename shadow）位于同一事务，绝不出现半换状态。
+    pub fn rebuild_profile_rollups(&mut self) -> anyhow::Result<ProfileRollupRebuildOutcome> {
+        // 第 1 段：独立事务先标记 invalid（durable 的“重建进行中”）。
+        self.mark_rollup_invalid()?;
+
+        // 第 2 段：原子 rebuild body。
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        rebuild_profile_rollups_in_tx(&tx)?;
+        // 写 schema_version 与 ready 状态（与换表同事务，保证一致翻转）。
+        upsert_rollup_metadata(
+            &tx,
+            ROLLUP_METADATA_SCHEMA_VERSION_KEY,
+            PROFILE_ROLLUP_SCHEMA_VERSION,
+        )?;
+        upsert_rollup_metadata(&tx, ROLLUP_METADATA_STATE_KEY, ROLLUP_STATE_READY)?;
+        let rollup_row_count: i64 =
+            tx.query_row("select count(*) from usage_rollups_15m", [], |row| {
+                row.get(0)
+            })?;
+        tx.commit()?;
+
+        Ok(ProfileRollupRebuildOutcome {
+            rebuilt: true,
+            rollup_row_count: rollup_row_count as usize,
+            schema_version: PROFILE_ROLLUP_SCHEMA_VERSION.to_string(),
+        })
+    }
+
+    /// 独立事务把 rollup state 置为 invalid（rebuild 起始处调用）。
+    fn mark_rollup_invalid(&mut self) -> anyhow::Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_rollup_metadata(&tx, ROLLUP_METADATA_STATE_KEY, ROLLUP_STATE_INVALID)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 读取 rollup metadata 单值（缺表/缺行返回 None）。
+    fn rollup_metadata_value(&self, key: &str) -> anyhow::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "select value from usage_rollup_metadata where key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn rollup_row_count(&self) -> anyhow::Result<i64> {
+        self.conn
+            .query_row("select count(*) from usage_rollups_15m", [], |row| {
+                row.get(0)
+            })
+            .map_err(Into::into)
+    }
+
+    /// tracked raw 侧全局守恒聚合：与 rebuild/upsert 相同的 clamp/CASE 方言，
+    /// 顺序 input/billable/output/cached/cache_creation/reasoning/unattributed/total/count。
+    fn raw_conservation_totals(&self) -> anyhow::Result<[i64; 9]> {
+        self.conn
+            .query_row(ROLLUP_RAW_CONSERVATION_SQL, [], |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ])
+            })
+            .map_err(Into::into)
+    }
+
+    /// rollup 侧全局守恒聚合（预聚合列直接求和），列序与 raw_conservation_totals 对齐。
+    fn rollup_conservation_totals(&self) -> anyhow::Result<[i64; 9]> {
+        self.conn
+            .query_row(ROLLUP_ROLLUP_CONSERVATION_SQL, [], |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ])
+            })
+            .map_err(Into::into)
     }
 
     pub fn insert_observation_for_tracking_window(
@@ -334,52 +648,70 @@ impl UsageStore {
         if let Some(tracking_window_id) = tracking_window_id {
             self.validate_tracking_window(tracking_window_id, observation.observed_at)?;
         }
-        let dedupe_key = compute_dedupe_key(observation);
-        let confidence = match observation.source_record_id_confidence {
-            SourceRecordIdConfidence::Exact => "exact",
-            SourceRecordIdConfidence::Fallback => "fallback",
-        };
-        let inserted = self.conn.execute(
-            r#"
-            insert or ignore into token_observations (
-              tracking_window_id, source, adapter_version, source_record_id, source_record_id_confidence,
-              session_id, turn_id, turn_boundary_id, source_path, line_no, byte_offset,
-              input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-              reasoning_output_tokens, total_tokens, cumulative_total_tokens, model, cwd,
-              observed_at, token_payload_hash, dedupe_key
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
-            "#,
-            params![
-                tracking_window_id,
-                observation.source,
-                observation.adapter_version,
-                observation.source_record_id,
-                confidence,
-                observation.session_id,
-                observation.turn_id,
-                observation.turn_boundary_id,
-                observation.source_path,
-                observation.line_no,
-                observation.byte_offset,
-                observation.input_tokens,
-                observation.output_tokens,
-                observation.cached_input_tokens,
-                observation.cache_creation_input_tokens,
-                observation.reasoning_output_tokens,
-                observation.total_tokens,
-                observation.cumulative_total_tokens,
-                observation.model,
-                observation.cwd,
-                observation.observed_at.to_rfc3339(),
-                observation.token_payload_hash,
-                dedupe_key,
-            ],
-        )?;
+
+        // 原子双写：raw insert 与 rollup upsert 位于同一事务，任一步失败先整体回滚。
+        // 用 unchecked_transaction 从 &self 取事务，避免为适配 IngestScheduler 改成 &mut self。
+        let tx = self.conn.unchecked_transaction()?;
+        let inserted = insert_raw_observation(&tx, observation, tracking_window_id)?;
+
+        // dedupe 命中：raw 与 rollup 都不变，直接提交空事务。
         if inserted == 0 {
-            Ok(InsertOutcome::Duplicate)
-        } else {
-            Ok(InsertOutcome::Inserted)
+            tx.commit()?;
+            return Ok(InsertOutcome::Duplicate);
         }
+
+        // untracked（测试用）观测永不写 rollup。
+        if tracking_window_id.is_none() {
+            tx.commit()?;
+            return Ok(InsertOutcome::Inserted);
+        }
+
+        // OVERRIDE B：state=invalid 即 raw-only 降级，跳过 rollup upsert 且不报错；
+        // 缺 state（migration 未写）视为“可增量双写”，从首条 insert 起就增量维护 rollup。
+        // 增量维护不要求 schema_version==current（版本 gating 只在 Task 5/6 管查询就绪）。
+        if rollup_state(&tx)?.as_deref() == Some(ROLLUP_STATE_INVALID) {
+            tx.commit()?;
+            return Ok(InsertOutcome::Inserted);
+        }
+
+        match upsert_profile_rollup(&tx, observation) {
+            Ok(()) => {
+                tx.commit()?;
+                Ok(InsertOutcome::Inserted)
+            }
+            // OVERRIDE A：rollup 是派生模型，其写入失败不能丢失唯一事实源 raw。
+            Err(_rollup_error) => {
+                // 1. 回滚原双写事务（此时 raw 尚未持久化）。
+                drop(tx);
+                // 2/3. 新事务只写 raw 并持久化 state=invalid，进入 raw-only 降级模式。
+                //     沿用相同 dedupe key，重试幂等。若此事务也失败则按 storage failure 上报，
+                //     不能声称已保存。
+                self.write_raw_only_and_mark_invalid(observation, tracking_window_id)?;
+                // 4. raw 确已持久化，返回 Inserted 而非错误。
+                Ok(InsertOutcome::Inserted)
+            }
+        }
+    }
+
+    /// raw-only 降级写入：新事务内写 raw observation + 标记 rollup state=invalid。
+    /// 仅在检测到 rollup 写失败后调用；沿用相同 dedupe key 保证幂等重试。
+    fn write_raw_only_and_mark_invalid(
+        &self,
+        observation: &NormalizedObservation,
+        tracking_window_id: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        insert_raw_observation(&tx, observation, tracking_window_id)?;
+        tx.execute(
+            r#"
+            insert into usage_rollup_metadata (key, value)
+            values (?1, ?2)
+            on conflict(key) do update set value = excluded.value
+            "#,
+            params![ROLLUP_METADATA_STATE_KEY, ROLLUP_STATE_INVALID],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn validate_tracking_window(
@@ -812,10 +1144,15 @@ impl UsageStore {
         drivers
     }
 
-    fn year_profile_from_rows(
+    fn year_profile_from_rows<Tz>(
         rows: &[PricedProfileObservationRow],
-        now_local: DateTime<Local>,
-    ) -> YearProfileSummary {
+        now_local: DateTime<Tz>,
+    ) -> YearProfileSummary
+    where
+        Tz: chrono::TimeZone + Copy,
+    {
+        // 热力图按 now_local 时区归属本地日期（不使用系统 Local），与 raw/rollup 路径一致。
+        let tz = now_local.timezone();
         let today = now_local.date_naive();
         let first_day = today - chrono::Days::new(364);
         let mut days = (0..365)
@@ -826,7 +1163,7 @@ impl UsageStore {
             .collect::<BTreeMap<_, _>>();
 
         for row in rows {
-            let local_date = row.observed_at.with_timezone(&Local).date_naive();
+            let local_date = row.observed_at.with_timezone(&tz).date_naive();
             if let Some((estimated_cost, total_tokens)) = days.get_mut(&local_date) {
                 *estimated_cost += row.estimated_cost;
                 *total_tokens += row.total_tokens;
@@ -887,12 +1224,16 @@ impl UsageStore {
         }
     }
 
-    fn period_usage_trend(
+    fn period_usage_trend<Tz>(
         period: ProfilePeriod,
         rows: &[PricedProfileObservationRow],
         now_utc: DateTime<Utc>,
-        now_local: DateTime<Local>,
-    ) -> anyhow::Result<crate::core::profile::PeriodUsageTrend> {
+        now_local: DateTime<Tz>,
+    ) -> anyhow::Result<crate::core::profile::PeriodUsageTrend>
+    where
+        Tz: chrono::TimeZone + Copy,
+        Tz::Offset: std::fmt::Display,
+    {
         let mut trend = empty_period_usage_trend(period, now_utc, now_local)?;
         for row in rows {
             if let Some(bucket) = trend.buckets.iter_mut().find(|bucket| {
@@ -906,29 +1247,30 @@ impl UsageStore {
         Ok(trend)
     }
 
-    pub fn profile_summary_at(
+    /// 用已定价的 year/period 行构造完整 ProfileSummary。raw 与 rollup 两条路径共用此函数，
+    /// 保证 ranked_breakdown / cost_drivers 的 share f64 除法顺序完全一致（parity 精确相等）。
+    fn build_summary_from_priced_rows<Tz>(
         &self,
         period: ProfilePeriod,
         now_utc: DateTime<Utc>,
-        now_local: DateTime<Local>,
-    ) -> anyhow::Result<ProfileSummary> {
-        let first_year_day = now_local.date_naive() - chrono::Days::new(364);
-        let year_start = first_year_day
-            .and_hms_opt(0, 0, 0)
-            .and_then(|start| start.and_local_timezone(Local).single())
-            .ok_or_else(|| anyhow::anyhow!("invalid local year profile start: {first_year_day}"))?;
-        let year_rows =
-            Self::priced_rows(&self.profile_rows_between(year_start.with_timezone(&Utc), now_utc)?);
-        let (period_start, period_end) = period_bounds(period, now_utc, now_local)?;
-        let period_rows = Self::priced_rows(&self.profile_rows_between(period_start, period_end)?);
+        now_local: DateTime<Tz>,
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+        year_rows: &[PricedProfileObservationRow],
+        period_rows: &[PricedProfileObservationRow],
+    ) -> anyhow::Result<ProfileSummary>
+    where
+        Tz: chrono::TimeZone + Copy,
+        Tz::Offset: std::fmt::Display,
+    {
         let period_estimated_cost: f64 = period_rows.iter().map(|row| row.estimated_cost).sum();
         let period_total_tokens: i64 = period_rows.iter().map(|row| row.total_tokens).sum();
-        let trend = Self::period_usage_trend(period, &period_rows, now_utc, now_local)?;
+        let trend = Self::period_usage_trend(period, period_rows, now_utc, now_local.clone())?;
 
         Ok(ProfileSummary {
             generated_at: now_utc,
             currency: "CNY".to_string(),
-            year_profile: Self::year_profile_from_rows(&year_rows, now_local),
+            year_profile: Self::year_profile_from_rows(year_rows, now_local),
             selected_period: PeriodProfileSummary {
                 period,
                 started_at: period_start,
@@ -936,7 +1278,7 @@ impl UsageStore {
                 estimated_cost: period_estimated_cost,
                 total_tokens: period_total_tokens,
                 trend,
-                model_breakdown: Self::ranked_breakdown(&period_rows, |row| {
+                model_breakdown: Self::ranked_breakdown(period_rows, |row| {
                     let label = model_label(row.model.as_deref());
                     let key = if label == "Unknown" {
                         "unknown".to_string()
@@ -945,7 +1287,7 @@ impl UsageStore {
                     };
                     (key, label)
                 }),
-                source_breakdown: Self::ranked_breakdown(&period_rows, |row| {
+                source_breakdown: Self::ranked_breakdown(period_rows, |row| {
                     let label = source_label(&row.source);
                     let key = if label == "Unknown" {
                         "unknown".to_string()
@@ -954,9 +1296,399 @@ impl UsageStore {
                     };
                     (key, label)
                 }),
-                cost_drivers: Self::cost_drivers(&period_rows),
+                cost_drivers: Self::cost_drivers(period_rows),
             },
         })
+    }
+
+    /// 计算 year heatmap 范围起点（now_local 时区的过去第 365 个本地日午夜）。
+    fn year_profile_start<Tz>(now_local: DateTime<Tz>) -> anyhow::Result<DateTime<Utc>>
+    where
+        Tz: chrono::TimeZone + Copy,
+    {
+        let tz = now_local.timezone();
+        let first_year_day = now_local.date_naive() - chrono::Days::new(364);
+        let year_start = first_year_day
+            .and_hms_opt(0, 0, 0)
+            .and_then(|start| tz.from_local_datetime(&start).single())
+            .ok_or_else(|| anyhow::anyhow!("invalid local year profile start: {first_year_day}"))?;
+        Ok(year_start.with_timezone(&Utc))
+    }
+
+    /// 显式 raw 参考路径：整段范围都扫 token_observations 逐行定价。作为 rollup fallback，
+    /// 也是 parity 测试的 ground truth。时区泛型，生产入口传 chrono::Local。
+    pub fn profile_summary_raw_at_in_timezone<Tz>(
+        &self,
+        period: ProfilePeriod,
+        now_utc: DateTime<Utc>,
+        now_local: DateTime<Tz>,
+    ) -> anyhow::Result<ProfileSummary>
+    where
+        Tz: chrono::TimeZone + Copy,
+        Tz::Offset: std::fmt::Display,
+    {
+        let year_start = Self::year_profile_start(now_local.clone())?;
+        let year_rows = Self::priced_rows(&self.profile_rows_between(year_start, now_utc)?);
+        let (period_start, period_end) = period_bounds(period, now_utc, now_local.clone())?;
+        let period_rows = Self::priced_rows(&self.profile_rows_between(period_start, period_end)?);
+        self.build_summary_from_priced_rows(
+            period,
+            now_utc,
+            now_local,
+            period_start,
+            period_end,
+            &year_rows,
+            &period_rows,
+        )
+    }
+
+    /// 生产同步入口（保持既有签名/契约）。委托诊断版本并只返回 summary。
+    pub fn profile_summary_at(
+        &self,
+        period: ProfilePeriod,
+        now_utc: DateTime<Utc>,
+        now_local: DateTime<Local>,
+    ) -> anyhow::Result<ProfileSummary> {
+        Ok(self
+            .profile_summary_with_diagnostics_at(period, now_utc, now_local)?
+            .summary)
+    }
+
+    /// 生产诊断入口：绑定 chrono::Local，返回 summary + 查询来源诊断。
+    pub fn profile_summary_with_diagnostics_at(
+        &self,
+        period: ProfilePeriod,
+        now_utc: DateTime<Utc>,
+        now_local: DateTime<Local>,
+    ) -> anyhow::Result<ProfileQueryOutcome> {
+        self.profile_summary_with_diagnostics_at_in_timezone(period, now_utc, now_local)
+    }
+
+    /// 诊断版查询：优先走 rollup（完整桶 + 首尾 raw 部分桶），任何不可用/异常时整体回退
+    /// 完整 raw 路径。时区泛型，供 parity 测试驱动非 Local 时区。
+    ///
+    /// 回退触发条件（任一）：state != ready 或 schema_version != 当前；任一用户可见边界未对齐
+    /// 到 900 秒（rollup 桶可能横跨两个可见桶）；rollup 读取/解析出错。回退时丢弃全部 rollup
+    /// 中间结果，用新的 raw 路径重算，绝不返回部分数据。
+    pub fn profile_summary_with_diagnostics_at_in_timezone<Tz>(
+        &self,
+        period: ProfilePeriod,
+        now_utc: DateTime<Utc>,
+        now_local: DateTime<Tz>,
+    ) -> anyhow::Result<ProfileQueryOutcome>
+    where
+        Tz: chrono::TimeZone + Copy,
+        Tz::Offset: std::fmt::Display,
+    {
+        match self.try_profile_summary_from_rollup(period, now_utc, now_local.clone())? {
+            Some(outcome) => Ok(outcome),
+            None => {
+                // 完整 raw 回退：新的读取路径，丢弃任何 rollup 中间结果。
+                let summary =
+                    self.profile_summary_raw_at_in_timezone(period, now_utc, now_local)?;
+                Ok(ProfileQueryOutcome {
+                    summary,
+                    source: ProfileQuerySource::RawFallback,
+                    rollup_row_count: 0,
+                    rollup_schema_version: None,
+                })
+            }
+        }
+    }
+
+    /// 尝试用 rollup 构造 summary；返回 None 表示应回退 raw（未就绪/边界不对齐/读取失败）。
+    /// 仅在此判定就绪时读 state/schema_version 两行，不重扫 raw 做守恒 checksum。
+    fn try_profile_summary_from_rollup<Tz>(
+        &self,
+        period: ProfilePeriod,
+        now_utc: DateTime<Utc>,
+        now_local: DateTime<Tz>,
+    ) -> anyhow::Result<Option<ProfileQueryOutcome>>
+    where
+        Tz: chrono::TimeZone + Copy,
+        Tz::Offset: std::fmt::Display,
+    {
+        // 1) 廉价就绪门：只读两行 metadata。
+        let (ready, schema_version) = self.profile_rollup_query_ready()?;
+        if !ready {
+            return Ok(None);
+        }
+
+        // 2) 计算范围与所有用户可见边界。
+        let year_start = Self::year_profile_start(now_local.clone())?;
+        let (period_start, period_end) = period_bounds(period, now_utc, now_local.clone())?;
+        let trend = empty_period_usage_trend(period, now_utc, now_local.clone())?;
+
+        // 边界对齐守卫：所有“用户可见的内部日历/趋势边界”必须对齐 900 秒，否则一个 rollup 桶
+        // 可能横跨两个可见桶被错误归类 → 整体回退。范围的外侧结束点 = now（通常不对齐）不在此列：
+        // 它由尾部 raw 部分桶精确处理（同时正确排除 future 观测）。范围起点是本地午夜，天然对齐，
+        // 也作为首个 trend 桶 started_at 一并校验。
+        let mut boundaries: Vec<DateTime<Utc>> = vec![year_start, period_start];
+        for bucket in &trend.buckets {
+            boundaries.push(bucket.started_at);
+            boundaries.push(bucket.ended_at);
+        }
+        let tz = now_local.timezone();
+        let first_heatmap_day = now_local.date_naive() - chrono::Days::new(364);
+        for offset in 0..=365 {
+            let day = first_heatmap_day + chrono::Days::new(offset);
+            let midnight = day
+                .and_hms_opt(0, 0, 0)
+                .and_then(|naive| tz.from_local_datetime(&naive).single());
+            // 热力图午夜若因该时区午夜 DST 而 ambiguous/nonexistent，则回退 raw（保守正确）。
+            let Some(midnight) = midnight else {
+                return Ok(None);
+            };
+            boundaries.push(midnight.with_timezone(&Utc));
+        }
+        if boundaries.iter().any(|instant| {
+            instant
+                .timestamp()
+                .rem_euclid(PROFILE_ROLLUP_BUCKET_SECONDS)
+                != 0
+        }) {
+            return Ok(None);
+        }
+
+        // 3) 分别取 year 与 period 范围的聚合行（完整 rollup 桶 + 首尾 raw 部分桶）。
+        let (year_aggregates, year_rollup_rows) =
+            match self.aggregates_for_range(year_start, now_utc) {
+                Ok(value) => value,
+                Err(_) => return Ok(None),
+            };
+        let (period_aggregates, period_rollup_rows) =
+            match self.aggregates_for_range(period_start, period_end) {
+                Ok(value) => value,
+                Err(_) => return Ok(None),
+            };
+
+        let year_rows = Self::priced_aggregate_rows(&year_aggregates);
+        let period_rows = Self::priced_aggregate_rows(&period_aggregates);
+        let summary = self.build_summary_from_priced_rows(
+            period,
+            now_utc,
+            now_local,
+            period_start,
+            period_end,
+            &year_rows,
+            &period_rows,
+        )?;
+
+        Ok(Some(ProfileQueryOutcome {
+            summary,
+            source: ProfileQuerySource::Rollup,
+            rollup_row_count: year_rollup_rows + period_rollup_rows,
+            rollup_schema_version: schema_version,
+        }))
+    }
+
+    /// 廉价就绪判定：只读 state + schema_version 两行 metadata，不扫 raw。
+    /// 返回 (ready, schema_version)。ready 需 state==ready 且 schema_version==当前版本。
+    fn profile_rollup_query_ready(&self) -> anyhow::Result<(bool, Option<String>)> {
+        let state = self.rollup_metadata_value(ROLLUP_METADATA_STATE_KEY)?;
+        if state.as_deref() != Some(ROLLUP_STATE_READY) {
+            return Ok((false, None));
+        }
+        let schema_version = self.rollup_metadata_value(ROLLUP_METADATA_SCHEMA_VERSION_KEY)?;
+        if schema_version.as_deref() != Some(PROFILE_ROLLUP_SCHEMA_VERSION) {
+            return Ok((false, None));
+        }
+        Ok((true, schema_version))
+    }
+
+    /// 取 `[start, end)` 的聚合行：中间完整 15 分钟桶读 rollup，首尾未被完整覆盖的桶读 raw。
+    /// 返回 (合并后的聚合, 读到的 rollup 行数)。三段区间互斥且拼满 [start,end)，不重复计数。
+    fn aggregates_for_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> anyhow::Result<(
+        Vec<crate::core::profile_rollup::ProfileTokenAggregate>,
+        usize,
+    )> {
+        use crate::core::profile_rollup::ProfileTokenAggregate;
+
+        let start_ts = start.timestamp();
+        let end_ts = end.timestamp();
+        // first_full = ceil(start,900)；last_full_exclusive = floor(end,900)。
+        let first_full =
+            start_ts.div_euclid(PROFILE_ROLLUP_BUCKET_SECONDS) * PROFILE_ROLLUP_BUCKET_SECONDS;
+        let first_full = if first_full < start_ts {
+            first_full + PROFILE_ROLLUP_BUCKET_SECONDS
+        } else {
+            first_full
+        };
+        let last_full_exclusive =
+            end_ts.div_euclid(PROFILE_ROLLUP_BUCKET_SECONDS) * PROFILE_ROLLUP_BUCKET_SECONDS;
+
+        // 用 (bucket_start_utc, source, model_key) 归并所有来源（rollup + 首尾 raw）。
+        let mut merged: BTreeMap<(i64, String, String), ProfileTokenAggregate> = BTreeMap::new();
+        let mut rollup_row_count = 0usize;
+
+        // 中间完整桶：只读 rollup 表。
+        if first_full < last_full_exclusive {
+            let full_end = DateTime::<Utc>::from_timestamp(last_full_exclusive, 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid rollup full-range end timestamp"))?;
+            let full_start = DateTime::<Utc>::from_timestamp(first_full, 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid rollup full-range start timestamp"))?;
+            for aggregate in self.rollup_aggregates_between(full_start, full_end)? {
+                rollup_row_count += 1;
+                let key = (
+                    aggregate.bucket_start_utc,
+                    aggregate.source.clone(),
+                    normalize_model_key(aggregate.model.as_deref()),
+                );
+                merge_aggregate(merged.entry(key).or_default(), &aggregate);
+            }
+        }
+
+        // 首部分桶 [start, min(first_full, end))。
+        let head_end_ts = first_full.min(end_ts);
+        if start_ts < head_end_ts {
+            let head_end = DateTime::<Utc>::from_timestamp(head_end_ts, 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid rollup head-edge end timestamp"))?;
+            self.accumulate_raw_edge(start, head_end, &mut merged)?;
+        }
+
+        // 尾部分桶 [max(last_full_exclusive, start, head_end), end)。
+        // clamp 到 head_end 是自保护：若调用方传入未对齐 start 且落在同一桶内（middle 为空），
+        // head 已覆盖 [start, end)，tail 起点必须 >= head_end 才不与 head 重复计数。
+        // 现有两个调用点的 start 都经对齐守卫保证 900 对齐，此处 clamp 只为防御未来误用。
+        let tail_start_ts = last_full_exclusive.max(start_ts).max(head_end_ts);
+        if tail_start_ts < end_ts {
+            let tail_start = DateTime::<Utc>::from_timestamp(tail_start_ts, 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid rollup tail-edge start timestamp"))?;
+            self.accumulate_raw_edge(tail_start, end, &mut merged)?;
+        }
+
+        Ok((merged.into_values().collect(), rollup_row_count))
+    }
+
+    /// 把 `[start, end)` 内的 raw 观测逐行聚合进 merged（部分桶用；与 rollup 同一 clamp 方言）。
+    fn accumulate_raw_edge(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        merged: &mut BTreeMap<
+            (i64, String, String),
+            crate::core::profile_rollup::ProfileTokenAggregate,
+        >,
+    ) -> anyhow::Result<()> {
+        use crate::core::profile_rollup::{
+            billable_uncached_input_tokens, unattributed_total_tokens, ProfileTokenAggregate,
+        };
+        for row in self.profile_rows_between(start, end)? {
+            let bucket = bucket_start_utc(row.observed_at);
+            let model_key = normalize_model_key(row.model.as_deref());
+            let entry = merged
+                .entry((bucket, row.source.clone(), model_key))
+                .or_default();
+            // 首次填充身份键（bucket/source/model）。
+            entry.bucket_start_utc = bucket;
+            entry.source = row.source.clone();
+            entry.model = row.model.clone();
+            let contribution = ProfileTokenAggregate {
+                bucket_start_utc: bucket,
+                source: row.source.clone(),
+                model: row.model.clone(),
+                input_tokens: row.input_tokens,
+                billable_uncached_input_tokens: billable_uncached_input_tokens(
+                    row.input_tokens,
+                    row.cached_input_tokens,
+                    row.cache_creation_input_tokens,
+                ),
+                output_tokens: row.output_tokens,
+                cached_input_tokens: row.cached_input_tokens,
+                cache_creation_input_tokens: row.cache_creation_input_tokens,
+                reasoning_output_tokens: row.reasoning_output_tokens,
+                unattributed_total_tokens: unattributed_total_tokens(
+                    row.input_tokens,
+                    row.output_tokens,
+                    row.cached_input_tokens,
+                    row.cache_creation_input_tokens,
+                    row.reasoning_output_tokens,
+                    row.total_tokens,
+                ),
+                total_tokens: row.total_tokens,
+                observation_count: 1,
+            };
+            merge_aggregate(entry, &contribution);
+        }
+        Ok(())
+    }
+
+    /// 读 `[start, end)` 内的完整 rollup 桶（只读 usage_rollups_15m，不扫 raw）。
+    fn rollup_aggregates_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<crate::core::profile_rollup::ProfileTokenAggregate>> {
+        use crate::core::profile_rollup::ProfileTokenAggregate;
+        let mut stmt = self.conn.prepare(
+            r#"
+            select bucket_start_utc, source, model,
+                   input_tokens, billable_uncached_input_tokens, output_tokens,
+                   cached_input_tokens, cache_creation_input_tokens, reasoning_output_tokens,
+                   unattributed_total_tokens, total_tokens, observation_count
+            from usage_rollups_15m
+            where bucket_start_utc >= ?1 and bucket_start_utc < ?2
+            order by bucket_start_utc asc, source asc, model asc
+            "#,
+        )?;
+        let rows = stmt.query_map(params![start.timestamp(), end.timestamp()], |row| {
+            let model_key: String = row.get(2)?;
+            Ok(ProfileTokenAggregate {
+                bucket_start_utc: row.get(0)?,
+                source: row.get(1)?,
+                model: crate::core::profile_rollup::model_from_key(&model_key),
+                input_tokens: row.get(3)?,
+                billable_uncached_input_tokens: row.get(4)?,
+                output_tokens: row.get(5)?,
+                cached_input_tokens: row.get(6)?,
+                cache_creation_input_tokens: row.get(7)?,
+                reasoning_output_tokens: row.get(8)?,
+                unattributed_total_tokens: row.get(9)?,
+                total_tokens: row.get(10)?,
+                observation_count: row.get(11)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 把聚合行定价成 PricedProfileObservationRow：归属瞬间用桶起点（守卫已保证完整桶落在
+    /// 单一 trend 桶/热力图日内），复用与 raw 相同的下游 breakdown/cost_drivers/年历聚合。
+    fn priced_aggregate_rows(
+        aggregates: &[crate::core::profile_rollup::ProfileTokenAggregate],
+    ) -> Vec<PricedProfileObservationRow> {
+        use crate::core::pricing::{
+            estimate_aggregated_model_cost_breakdown, AggregatedModelTokenUsage,
+        };
+        aggregates
+            .iter()
+            .filter_map(|aggregate| {
+                let observed_at = DateTime::<Utc>::from_timestamp(aggregate.bucket_start_utc, 0)?;
+                let usage = AggregatedModelTokenUsage {
+                    model: aggregate.model.clone(),
+                    input_tokens: aggregate.input_tokens,
+                    billable_uncached_input_tokens: aggregate.billable_uncached_input_tokens,
+                    output_tokens: aggregate.output_tokens,
+                    cached_input_tokens: aggregate.cached_input_tokens,
+                    cache_creation_input_tokens: aggregate.cache_creation_input_tokens,
+                    reasoning_output_tokens: aggregate.reasoning_output_tokens,
+                    unattributed_total_tokens: aggregate.unattributed_total_tokens,
+                    total_tokens: aggregate.total_tokens,
+                };
+                let priced = estimate_aggregated_model_cost_breakdown(&usage);
+                Some(PricedProfileObservationRow {
+                    source: aggregate.source.clone(),
+                    model: aggregate.model.clone(),
+                    estimated_cost: priced.estimated_cost,
+                    total_tokens: priced.total_tokens,
+                    drivers: priced.drivers,
+                    observed_at,
+                })
+            })
+            .collect()
     }
 
     pub fn open_tracking_window(&self, started_at: DateTime<Utc>) -> anyhow::Result<i64> {
@@ -1081,3 +1813,415 @@ impl UsageStore {
         Ok(value)
     }
 }
+
+/// 读取 rollup 状态机当前 state（None 表示 migration 未写、尚未 rebuild）。
+/// 在事务内读取，保证与同事务写入一致。
+fn rollup_state(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<Option<String>> {
+    tx.query_row(
+        "select value from usage_rollup_metadata where key = ?1",
+        params![ROLLUP_METADATA_STATE_KEY],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// 写 retention 成功元数据：推进 last_success_at、记录本次删除数、清理失败标记。
+/// 抽成独立函数供 Ready 主路径与 raw-only 降级路径共用，避免两处口径漂移。
+fn write_retention_metadata(
+    tx: &rusqlite::Transaction<'_>,
+    now: DateTime<Utc>,
+    deleted_observations: usize,
+) -> anyhow::Result<()> {
+    tx.execute(
+        r#"
+        insert into retention_state (key, value)
+        values ('last_success_at', ?1)
+        on conflict(key) do update set value = excluded.value
+        "#,
+        params![now.to_rfc3339()],
+    )?;
+    tx.execute(
+        r#"
+        insert into retention_state (key, value)
+        values ('last_deleted_observations', ?1)
+        on conflict(key) do update set value = excluded.value
+        "#,
+        params![deleted_observations.to_string()],
+    )?;
+    tx.execute(
+        "delete from retention_state where key in ('last_failure_at', 'last_error_kind')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Ready 模式 rollup 边界维护（在 raw 删除后、metadata 更新前于同事务内执行）。
+///
+/// cutoff 无需 15 分钟对齐；用 `bucket_start_utc` 取 cutoff 所属桶起点，与增量写入对齐。
+/// 步骤：删除完全过期桶（< cutoff_bucket）→ 删除旧边界聚合（= cutoff_bucket）→
+/// 从保留的 tracked raw rows（raw 删除已剔除 < cutoff 的行）重建 `[cutoff_bucket, cutoff_bucket+900)`。
+/// 重建 SELECT 复用 `upsert_profile_rollup` 相同的 billable/unattributed CASE 表达式，
+/// 保证增量 upsert / full rebuild / retention rebuild 同一数值域。整数域运算，不得转 REAL。
+fn maintain_rollup_boundary(
+    tx: &rusqlite::Transaction<'_>,
+    cutoff: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let cutoff_bucket = bucket_start_utc(cutoff);
+    let boundary_end = cutoff_bucket + PROFILE_ROLLUP_BUCKET_SECONDS;
+
+    // 删除完全过期桶与旧边界聚合（<= cutoff_bucket）。
+    tx.execute(
+        "delete from usage_rollups_15m where bucket_start_utc <= ?1",
+        params![cutoff_bucket],
+    )?;
+
+    // 从保留 raw 行重建边界桶：观测落在半开窗口 [cutoff_bucket, cutoff_bucket+900)，
+    // 仅统计 tracked（tracking_window_id is not null）行；raw 删除已剔除 < cutoff 的贡献。
+    // 时间戳用 strftime('%s') 转 unix 秒后再 floor 到桶，避免依赖 rfc3339 字符串比较。
+    tx.execute(
+        r#"
+        insert into usage_rollups_15m (
+          bucket_start_utc, source, model,
+          input_tokens, billable_uncached_input_tokens, output_tokens,
+          cached_input_tokens, cache_creation_input_tokens, reasoning_output_tokens,
+          unattributed_total_tokens, total_tokens, observation_count
+        )
+        select
+          ?1 as bucket_start_utc,
+          source,
+          coalesce(model, '') as model,
+          sum(input_tokens),
+          sum(max(input_tokens - cached_input_tokens - cache_creation_input_tokens, 0)),
+          sum(output_tokens),
+          sum(cached_input_tokens),
+          sum(cache_creation_input_tokens),
+          sum(reasoning_output_tokens),
+          sum(case when input_tokens = 0 and output_tokens = 0 and cached_input_tokens = 0
+                    and cache_creation_input_tokens = 0 and reasoning_output_tokens = 0
+                   then max(total_tokens, 0) else 0 end),
+          sum(total_tokens),
+          count(*)
+        from token_observations
+        where tracking_window_id is not null
+          and cast(strftime('%s', observed_at) as integer) >= ?1
+          and cast(strftime('%s', observed_at) as integer) < ?2
+        group by source, coalesce(model, '')
+        "#,
+        params![cutoff_bucket, boundary_end],
+    )?;
+    Ok(())
+}
+
+/// 把 `contribution` 累加进 `target`（合并 rollup 桶与 raw 部分桶的同 key 聚合）。
+/// 与 rollup 写入/重建同一数值域：saturating add——查询侧只读，即便极端溢出也退化为饱和
+/// 展示值而非 panic（写入侧仍用 checked add 拒绝溢出，事实源不受影响）。
+fn merge_aggregate(
+    target: &mut crate::core::profile_rollup::ProfileTokenAggregate,
+    contribution: &crate::core::profile_rollup::ProfileTokenAggregate,
+) {
+    target.bucket_start_utc = contribution.bucket_start_utc;
+    target.source = contribution.source.clone();
+    target.model = contribution.model.clone();
+    target.input_tokens = target
+        .input_tokens
+        .saturating_add(contribution.input_tokens);
+    target.billable_uncached_input_tokens = target
+        .billable_uncached_input_tokens
+        .saturating_add(contribution.billable_uncached_input_tokens);
+    target.output_tokens = target
+        .output_tokens
+        .saturating_add(contribution.output_tokens);
+    target.cached_input_tokens = target
+        .cached_input_tokens
+        .saturating_add(contribution.cached_input_tokens);
+    target.cache_creation_input_tokens = target
+        .cache_creation_input_tokens
+        .saturating_add(contribution.cache_creation_input_tokens);
+    target.reasoning_output_tokens = target
+        .reasoning_output_tokens
+        .saturating_add(contribution.reasoning_output_tokens);
+    target.unattributed_total_tokens = target
+        .unattributed_total_tokens
+        .saturating_add(contribution.unattributed_total_tokens);
+    target.total_tokens = target
+        .total_tokens
+        .saturating_add(contribution.total_tokens);
+    target.observation_count = target
+        .observation_count
+        .saturating_add(contribution.observation_count);
+}
+
+/// 写入 raw observation（唯一事实源）。封装原 23 列 insert-or-ignore，列映射保持不变。
+/// 返回受影响行数：1 表示新插入，0 表示 dedupe 命中。
+fn insert_raw_observation(
+    tx: &rusqlite::Transaction<'_>,
+    observation: &NormalizedObservation,
+    tracking_window_id: Option<i64>,
+) -> anyhow::Result<usize> {
+    let dedupe_key = compute_dedupe_key(observation);
+    let confidence = match observation.source_record_id_confidence {
+        SourceRecordIdConfidence::Exact => "exact",
+        SourceRecordIdConfidence::Fallback => "fallback",
+    };
+    let inserted = tx.execute(
+        r#"
+        insert or ignore into token_observations (
+          tracking_window_id, source, adapter_version, source_record_id, source_record_id_confidence,
+          session_id, turn_id, turn_boundary_id, source_path, line_no, byte_offset,
+          input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+          reasoning_output_tokens, total_tokens, cumulative_total_tokens, model, cwd,
+          observed_at, token_payload_hash, dedupe_key
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+        "#,
+        params![
+            tracking_window_id,
+            observation.source,
+            observation.adapter_version,
+            observation.source_record_id,
+            confidence,
+            observation.session_id,
+            observation.turn_id,
+            observation.turn_boundary_id,
+            observation.source_path,
+            observation.line_no,
+            observation.byte_offset,
+            observation.input_tokens,
+            observation.output_tokens,
+            observation.cached_input_tokens,
+            observation.cache_creation_input_tokens,
+            observation.reasoning_output_tokens,
+            observation.total_tokens,
+            observation.cumulative_total_tokens,
+            observation.model,
+            observation.cwd,
+            observation.observed_at.to_rfc3339(),
+            observation.token_payload_hash,
+            dedupe_key,
+        ],
+    )?;
+    Ok(inserted)
+}
+
+/// 增量维护派生 rollup：把该观测累加进对应 (bucket, source, model) 桶。
+///
+/// billable_uncached_input_tokens 与 unattributed_total_tokens 用 SQLite CASE/max 表达，
+/// 与 Task 2 core 函数（`billable_uncached_input_tokens`/`unattributed_total_tokens`）语义一致，
+/// 保证增量 upsert == 未来 full rebuild == retention rebuild 使用同一数值域。
+/// model=NULL 规范化为 ''，但不改动 raw 表中的 NULL。整数域运算，不得转 REAL。
+fn upsert_profile_rollup(
+    tx: &rusqlite::Transaction<'_>,
+    observation: &NormalizedObservation,
+) -> anyhow::Result<()> {
+    let bucket = bucket_start_utc(observation.observed_at);
+    let model_key = normalize_model_key(observation.model.as_deref());
+    tx.execute(
+        r#"
+        insert into usage_rollups_15m (
+          bucket_start_utc, source, model,
+          input_tokens, billable_uncached_input_tokens, output_tokens,
+          cached_input_tokens, cache_creation_input_tokens, reasoning_output_tokens,
+          unattributed_total_tokens, total_tokens, observation_count
+        ) values (
+          ?1, ?2, ?3,
+          ?4,
+          max(?4 - ?7 - ?8, 0),
+          ?5,
+          ?7, ?8, ?6,
+          case when ?4 = 0 and ?5 = 0 and ?7 = 0 and ?8 = 0 and ?6 = 0 then max(?9, 0) else 0 end,
+          ?9, 1
+        )
+        on conflict(bucket_start_utc, source, model) do update set
+          input_tokens = input_tokens + excluded.input_tokens,
+          billable_uncached_input_tokens =
+            billable_uncached_input_tokens + excluded.billable_uncached_input_tokens,
+          output_tokens = output_tokens + excluded.output_tokens,
+          cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
+          cache_creation_input_tokens =
+            cache_creation_input_tokens + excluded.cache_creation_input_tokens,
+          reasoning_output_tokens = reasoning_output_tokens + excluded.reasoning_output_tokens,
+          unattributed_total_tokens =
+            unattributed_total_tokens + excluded.unattributed_total_tokens,
+          total_tokens = total_tokens + excluded.total_tokens,
+          observation_count = observation_count + excluded.observation_count
+        "#,
+        params![
+            bucket,
+            observation.source,
+            model_key,
+            observation.input_tokens,
+            observation.output_tokens,
+            observation.reasoning_output_tokens,
+            observation.cached_input_tokens,
+            observation.cache_creation_input_tokens,
+            observation.total_tokens,
+        ],
+    )?;
+    Ok(())
+}
+
+/// upsert 单条 rollup metadata（state / schema_version 等），key 冲突时覆盖。
+fn upsert_rollup_metadata(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    tx.execute(
+        r#"
+        insert into usage_rollup_metadata (key, value)
+        values (?1, ?2)
+        on conflict(key) do update set value = excluded.value
+        "#,
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+/// shadow table 原子重建 body（在单个 Immediate 事务内执行；不含 metadata 翻转）。
+///
+/// 步骤：清理残留 shadow → 建与正式表约束一致的 shadow（含 typeof integer CHECK）→
+/// 一条 INSERT..SELECT 从所有 tracked raw 行按 (bucket, source, coalesce(model,'')) 聚合 →
+/// 全局守恒校验（8 分量 + count 相等）→ drop 正式表 → rename shadow 为正式表。
+/// 时间桶用 `cast(unixepoch(observed_at) as integer) / 900 * 900`，与 Rust `bucket_start_utc`
+/// 的 div_euclid 对齐（observed_at 恒为 post-1970 正 epoch，整除与 div_euclid 一致）。
+/// billable/unattributed CASE 表达式与 `upsert_profile_rollup` 完全同一方言，杜绝二义。
+fn rebuild_profile_rollups_in_tx(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    // 清理任何残留 shadow（上次崩溃遗留），保证从干净状态建表。
+    tx.execute(&format!("drop table if exists {ROLLUP_SHADOW_TABLE}"), [])?;
+
+    // shadow 表 schema 必须与正式表逐字一致（含非负 + typeof integer CHECK），
+    // 避免 SUM 溢出被静默提升为 REAL 后写回。
+    tx.execute(&rollup_table_ddl(ROLLUP_SHADOW_TABLE), [])?;
+
+    // 一条 INSERT..SELECT 全量聚合所有 tracked raw 行。
+    tx.execute(
+        &format!(
+            r#"
+            insert into {ROLLUP_SHADOW_TABLE} (
+              bucket_start_utc, source, model,
+              input_tokens, billable_uncached_input_tokens, output_tokens,
+              cached_input_tokens, cache_creation_input_tokens, reasoning_output_tokens,
+              unattributed_total_tokens, total_tokens, observation_count
+            )
+            select
+              cast(unixepoch(observed_at) as integer) / {bucket} * {bucket} as bucket_start_utc,
+              source,
+              coalesce(model, '') as model,
+              sum(input_tokens),
+              sum(max(input_tokens - cached_input_tokens - cache_creation_input_tokens, 0)),
+              sum(output_tokens),
+              sum(cached_input_tokens),
+              sum(cache_creation_input_tokens),
+              sum(reasoning_output_tokens),
+              sum(case when input_tokens = 0 and output_tokens = 0 and cached_input_tokens = 0
+                        and cache_creation_input_tokens = 0 and reasoning_output_tokens = 0
+                       then max(total_tokens, 0) else 0 end),
+              sum(total_tokens),
+              count(*)
+            from token_observations
+            where tracking_window_id is not null
+            group by bucket_start_utc, source, coalesce(model, '')
+            "#,
+            bucket = PROFILE_ROLLUP_BUCKET_SECONDS
+        ),
+        [],
+    )?;
+
+    // 全局守恒诊断：tracked raw 与 shadow 的 8 分量 + count 必须逐项相等。
+    let raw_totals = conservation_totals_in_tx(tx, ROLLUP_RAW_CONSERVATION_SQL)?;
+    let shadow_totals = conservation_totals_in_tx(
+        tx,
+        &ROLLUP_ROLLUP_CONSERVATION_SQL.replace("usage_rollups_15m", ROLLUP_SHADOW_TABLE),
+    )?;
+    if raw_totals != shadow_totals {
+        anyhow::bail!("profile rollup rebuild conservation mismatch");
+    }
+
+    // 换表：drop 正式表 + rename shadow，二者同事务，绝不出现半换状态。
+    tx.execute("drop table usage_rollups_15m", [])?;
+    tx.execute(
+        &format!("alter table {ROLLUP_SHADOW_TABLE} rename to usage_rollups_15m"),
+        [],
+    )?;
+    Ok(())
+}
+
+/// 在事务内执行一条守恒聚合 SQL，返回 9 元组（列序见 ROLLUP_RAW_CONSERVATION_SQL）。
+fn conservation_totals_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    sql: &str,
+) -> anyhow::Result<[i64; 9]> {
+    tx.query_row(sql, [], |row| {
+        Ok([
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+        ])
+    })
+    .map_err(Into::into)
+}
+
+/// 正式表 / shadow 表共用的建表 DDL（只替换表名）。约束与 migrate() 中 usage_rollups_15m 一致。
+fn rollup_table_ddl(table: &str) -> String {
+    format!(
+        r#"
+        create table {table} (
+          bucket_start_utc integer not null,
+          source text not null,
+          model text not null,
+          input_tokens integer not null default 0 check(input_tokens >= 0 and typeof(input_tokens) = 'integer'),
+          billable_uncached_input_tokens integer not null default 0 check(billable_uncached_input_tokens >= 0 and typeof(billable_uncached_input_tokens) = 'integer'),
+          output_tokens integer not null default 0 check(output_tokens >= 0 and typeof(output_tokens) = 'integer'),
+          cached_input_tokens integer not null default 0 check(cached_input_tokens >= 0 and typeof(cached_input_tokens) = 'integer'),
+          cache_creation_input_tokens integer not null default 0 check(cache_creation_input_tokens >= 0 and typeof(cache_creation_input_tokens) = 'integer'),
+          reasoning_output_tokens integer not null default 0 check(reasoning_output_tokens >= 0 and typeof(reasoning_output_tokens) = 'integer'),
+          unattributed_total_tokens integer not null default 0 check(unattributed_total_tokens >= 0 and typeof(unattributed_total_tokens) = 'integer'),
+          total_tokens integer not null default 0 check(total_tokens >= 0 and typeof(total_tokens) = 'integer'),
+          observation_count integer not null default 0 check(observation_count >= 0 and typeof(observation_count) = 'integer'),
+          primary key (bucket_start_utc, source, model)
+        )
+        "#
+    )
+}
+
+/// tracked raw 全局守恒聚合 SQL；列序：
+/// input / billable / output / cached / cache_creation / reasoning / unattributed / total / count。
+/// billable/unattributed 与 upsert_profile_rollup 同一 clamp/CASE 方言。
+const ROLLUP_RAW_CONSERVATION_SQL: &str = r#"
+    select
+      coalesce(sum(input_tokens), 0),
+      coalesce(sum(max(input_tokens - cached_input_tokens - cache_creation_input_tokens, 0)), 0),
+      coalesce(sum(output_tokens), 0),
+      coalesce(sum(cached_input_tokens), 0),
+      coalesce(sum(cache_creation_input_tokens), 0),
+      coalesce(sum(reasoning_output_tokens), 0),
+      coalesce(sum(case when input_tokens = 0 and output_tokens = 0 and cached_input_tokens = 0
+                and cache_creation_input_tokens = 0 and reasoning_output_tokens = 0
+               then max(total_tokens, 0) else 0 end), 0),
+      coalesce(sum(total_tokens), 0),
+      count(*)
+    from token_observations
+    where tracking_window_id is not null
+"#;
+
+/// rollup 侧全局守恒聚合 SQL（预聚合列直接求和），列序与 ROLLUP_RAW_CONSERVATION_SQL 对齐。
+/// rebuild body 通过替换表名复用此 SQL 对 shadow 表做同口径聚合。
+const ROLLUP_ROLLUP_CONSERVATION_SQL: &str = r#"
+    select
+      coalesce(sum(input_tokens), 0),
+      coalesce(sum(billable_uncached_input_tokens), 0),
+      coalesce(sum(output_tokens), 0),
+      coalesce(sum(cached_input_tokens), 0),
+      coalesce(sum(cache_creation_input_tokens), 0),
+      coalesce(sum(reasoning_output_tokens), 0),
+      coalesce(sum(unattributed_total_tokens), 0),
+      coalesce(sum(total_tokens), 0),
+      coalesce(sum(observation_count), 0)
+    from usage_rollups_15m
+"#;
