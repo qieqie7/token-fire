@@ -9,6 +9,8 @@ description: 当准备发布版本升级，并且需要打 tag、推送、完成
 
 按发布顺序执行：确认目标版本，升级版本元数据，验证一致性，提交，打 tag，推送，然后完成完整发布构建。
 
+构建完成后，根据前后版本差异补充用户可见的 Release Notes。现有脚本继续负责下载、安装和校验内容。
+
 如果用户没有提供目标版本，修改文件前必须停止。根据 SemVer 语义给出建议版本，并等待用户确认。
 
 ## 何时使用
@@ -32,9 +34,10 @@ description: 当准备发布版本升级，并且需要打 tag、推送、完成
 6. 为目标版本创建 annotated git tag。
 7. 推送 commit 和 tag。
 8. 完成要求的完整发布构建。
-9. 汇报准确的 commit、tag、push、build 证据。
+9. 分析前后发布版本差异，补充生成的 Release Notes。
+10. 汇报准确的 commit、tag、push、build 和 Release Notes 证据。
 
-版本一致性检查通过前不要打 tag。构建成功前不要宣称完成。
+版本一致性检查通过前不要打 tag。构建和 Release Notes 更新完成前不要宣称完成。
 
 ## 未提供版本时
 
@@ -69,6 +72,9 @@ rtk git tag -a v0.1.1 -m "v0.1.1"
 rtk git push
 rtk git push origin v0.1.1
 rtk bash scripts/local-release.sh
+rtk git describe --tags --abbrev=0 v0.1.1^
+rtk git log --oneline <previous_tag>..v0.1.1
+rtk git diff --stat <previous_tag>..v0.1.1
 ```
 
 替换示例里的版本号。只有 baseline release 文案需要同步时，才把 `agent-docs/release-versioning.md` 加入提交。
@@ -80,6 +86,26 @@ rtk bash scripts/local-release.sh
 - `dist-app/TokenFire_X.Y.Z_aarch64.dmg`
 - `dist-app/TokenFire_X.Y.Z_aarch64.dmg.sha256`
 - `dist-app/release-notes-vX.Y.Z.md`
+
+## 补充用户可见更新说明
+
+`scripts/local-release.sh` 成功后，找到目标 tag 之前的上一个已发布版本 tag。找不到时停止并请求用户指定比较基线。
+
+查看 `<previous_tag>..<target_tag>` 的 commit 和 diff，再读取相关实现、测试或用户文档。只写能够验证的用户可见变化；忽略版本号更新、纯重构、测试整理和没有用户影响的依赖更新。
+
+更新 `dist-app/release-notes-vX.Y.Z.md`，结构为：
+
+- 一句话版本价值摘要。
+- `## 本次更新`。
+- 非空时输出 `### 新功能`。
+- 非空时输出 `### 优化与修复`。
+- 只有升级需要额外操作、迁移或兼容性注意事项时，才输出 `## 升级说明`。
+
+没有用户可见变化时，在 `## 本次更新` 下明确说明本次为发布维护，不虚构功能。通用安装和 macOS 排障不属于升级说明。
+
+保留脚本生成的 H1。替换 H1 与第一个 `## 下载` 之间的内容，不在文件末尾追加；`## 下载` 及后续内容保持不变。找不到 H1 或 `## 下载` 时停止并报告，不猜测文件结构。
+
+## 发布异常
 
 如果只运行了 `scripts/release-pipeline.sh --bundle dmg --clean-required`，还没有完成可上传发布资产整理；需要补齐 `dist-app`，或改跑 `scripts/local-release.sh`。
 
@@ -114,6 +140,7 @@ rtk bash scripts/local-release.sh
 - commit 和 tag 的 push 结果
 - 构建命令和通过/失败结果
 - DMG 产物路径和文件名；如果只生成 `.app` 或 `.zip`，说明未完成 DMG 发布构建
+- Release Notes 使用的版本差异范围和最终文件路径
 
 如果 tag 推送后构建失败，必须说明 tag 已推送，并给出失败命令和错误。除非用户明确要求，不要改写或删除 tag。
 
