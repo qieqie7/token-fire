@@ -1468,7 +1468,7 @@ fn retention_rebuilds_profile_rollup_boundary_degrades_on_rollup_failure() {
     let retained = Utc.with_ymd_and_hms(2025, 6, 26, 12, 10, 0).unwrap();
 
     // 先插入观测让增量 rollup 正常写入，再安装失败触发器只影响 retention 的重建 INSERT。
-    let mut store = UsageStore::open(&db_path).unwrap();
+    let store = UsageStore::open(&db_path).unwrap();
     insert_tracked(&store, &observation("expired", 1000, expired)).unwrap();
     insert_tracked(&store, &observation("retained", 77, retained)).unwrap();
     drop(store);

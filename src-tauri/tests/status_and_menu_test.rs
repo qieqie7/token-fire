@@ -1849,7 +1849,7 @@ fn source_diagnostics_optional_source_with_recent_success_is_not_disabled() {
 #[test]
 fn source_diagnostics_sqlite_unavailable_overrides_recent_success() {
     let dir = tempdir().unwrap();
-    let mut paths = paths(dir.path().join("token-fire").as_path());
+    let paths = paths(dir.path().join("token-fire").as_path());
     fs::create_dir_all(paths.database.parent().unwrap()).unwrap();
     fs::write(&paths.database, b"not a sqlite database").unwrap();
     let app_state = AppState::new(paths.clone());
