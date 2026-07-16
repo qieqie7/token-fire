@@ -28,6 +28,15 @@ describe("profile css", () => {
     return css.slice(start, end);
   }
 
+  it("keeps heatmap active readouts minimal", () => {
+    const css = readFileSync(profileCssPath, "utf8");
+    const activeDay = cssBlock(css, '.profile-heatmap__day[data-active="true"]');
+
+    expect(activeDay).toContain("outline:");
+    expect(activeDay).toContain("outline-offset: 1px;");
+    expect(css).not.toContain("box-shadow: 0 0 0 8px");
+  });
+
   it("keeps the fixed menubar profile layout non-scrollable with aligned metric and attribution grids", () => {
     const css = readFileSync(profileCssPath, "utf8");
     const popover = cssBlock(css, ".profile-popover");

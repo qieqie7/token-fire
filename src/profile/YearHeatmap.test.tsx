@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { YearHeatmap } from "./YearHeatmap";
+import { YearHeatmap, formatHeatmapDayReadout } from "./YearHeatmap";
 import type { ProfileDayBucket } from "./types";
 
 function makeYearDays(
@@ -26,7 +26,39 @@ function makeYearDays(
 }
 
 describe("YearHeatmap", () => {
-  it("renders one daily cell per provided day with low-density header copy", () => {
+  it("formats day readouts for active and empty days", () => {
+    expect(
+      formatHeatmapDayReadout({
+        local_date: "2026-07-16",
+        estimated_cost: 9,
+        total_tokens: 9_400_000,
+        intensity: 4,
+      }),
+    ).toEqual({
+      title: "07-16",
+      value: "9.40M token",
+      meta: "估算 ¥9.00",
+      ariaLabel: "07-16 9.40M token，估算 ¥9.00",
+      empty: false,
+    });
+
+    expect(
+      formatHeatmapDayReadout({
+        local_date: "2026-07-17",
+        estimated_cost: 0,
+        total_tokens: 0,
+        intensity: 0,
+      }),
+    ).toEqual({
+      title: "07-17",
+      value: "0 token",
+      meta: "估算 ¥0.00",
+      ariaLabel: "07-17 0 token，估算 ¥0.00，无用量",
+      empty: true,
+    });
+  });
+
+  it("renders daily cells without native title attributes", () => {
     const days = makeYearDays("2025-07-06", { 0: 9 }, { 0: 9_400_000 });
     const html = renderToStaticMarkup(
       <YearHeatmap days={days} activeDays={182} estimatedCost={2914} totalTokens={412_000_000} />,
@@ -37,19 +69,8 @@ describe("YearHeatmap", () => {
     expect(html).toContain("活跃 182 天");
     expect(html).toContain("412.00M token");
     expect(html).toContain("估算 ¥2,914.00");
-    expect(html).toContain('data-intensity="4"');
-    expect((html.match(/class="profile-heatmap__placeholder"/g) ?? []).length).toBe(6);
-  });
-
-  it("uses day-level tooltips instead of weekly ranges", () => {
-    const days = makeYearDays("2025-07-06", { 0: 9 }, { 0: 9_400_000 });
-    const html = renderToStaticMarkup(
-      <YearHeatmap days={days} activeDays={1} estimatedCost={9} totalTokens={9_400_000} />,
-    );
-
-    expect(html).toContain("07-06 9.40M token · 估算 ¥9.00");
-    expect(html).not.toContain("07-06-07-13");
-    expect(html).not.toContain("峰值周");
+    expect(html).toContain('aria-label="07-06 9.40M token，估算 ¥9.00"');
+    expect(html).not.toContain("title=");
   });
 
   it("aligns sparse month labels to real month boundaries", () => {
@@ -93,5 +114,6 @@ describe("YearHeatmap", () => {
     expect(html).toContain("活跃 0 天");
     expect(html).toContain("0 token");
     expect((html.match(/class="profile-heatmap__day"/g) ?? []).length).toBe(0);
+    expect(html).not.toContain("tf-popover");
   });
 });

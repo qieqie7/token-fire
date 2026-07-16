@@ -99,6 +99,10 @@
   background: #202733;
 }
 
+.profile-heatmap__day {
+  cursor: default;
+}
+
 .profile-heatmap__placeholder {
   background: transparent;
 }
@@ -107,6 +111,11 @@
 .profile-heatmap__day[data-intensity="2"] { background: rgba(255, 138, 52, 0.48); }
 .profile-heatmap__day[data-intensity="3"] { background: rgba(255, 138, 52, 0.72); }
 .profile-heatmap__day[data-intensity="4"] { background: #ff8a34; }
+
+.profile-heatmap__day[data-active="true"] {
+  outline: 1px solid rgba(245, 247, 251, 0.78);
+  outline-offset: 1px;
+}
 
 .profile-heatmap__months {
   display: grid;
