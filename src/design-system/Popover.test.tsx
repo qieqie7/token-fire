@@ -1,7 +1,7 @@
 import type { PointerEvent } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import { Popover, composeEventHandlers, isRenderablePopoverContent } from "./Popover";
+import { Popover, composeEventHandlers, isRenderablePopoverContent, popoverReferenceEffectName } from "./Popover";
 
 const virtualReference = {
   getBoundingClientRect: () => ({
@@ -79,5 +79,10 @@ describe("Popover", () => {
     handler({} as PointerEvent<HTMLElement>);
 
     expect(calls).toEqual(["user", "injected"]);
+  });
+
+  it("uses a layout effect for reference updates in browser environments", () => {
+    expect(popoverReferenceEffectName({ document: {} })).toBe("layout");
+    expect(popoverReferenceEffectName({})).toBe("effect");
   });
 });

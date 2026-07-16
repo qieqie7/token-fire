@@ -17,6 +17,7 @@ import {
   cloneElement,
   isValidElement,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -56,6 +57,15 @@ type PopoverChildProps = {
   onBlur?: MaybeHandler<FocusEvent<HTMLElement>>;
   ref?: Ref<HTMLElement>;
 };
+
+type ReferenceEffectName = "effect" | "layout";
+
+export function popoverReferenceEffectName(scope: Pick<typeof globalThis, "document"> | Record<string, unknown> = globalThis): ReferenceEffectName {
+  return "document" in scope ? "layout" : "effect";
+}
+
+const usePopoverReferenceEffect =
+  popoverReferenceEffectName() === "layout" ? useLayoutEffect : useEffect;
 
 export function composeEventHandlers<E>(
   userHandler: MaybeHandler<E>,
@@ -131,7 +141,7 @@ export function Popover({
     ],
   });
 
-  useEffect(() => {
+  usePopoverReferenceEffect(() => {
     if (hasReferenceProp) refs.setReference(reference ?? null);
   }, [hasReferenceProp, reference, refs]);
 
