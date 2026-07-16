@@ -15,6 +15,7 @@
     "test:version-scripts": "node --test scripts/version-utils.test.mjs"
   },
   "dependencies": {
+    "@floating-ui/react": "^0.27.20",
     "@tauri-apps/api": "^2.0.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",

@@ -1,0 +1,47 @@
+.tf-popover {
+  z-index: 1000;
+  max-width: 210px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 7px;
+  background: rgba(16, 22, 32, 0.98);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+  color: var(--color-text-primary);
+  pointer-events: none;
+}
+
+.tf-popover__body {
+  padding: 8px 9px;
+}
+
+.tf-popover__title {
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.tf-popover__content {
+  color: var(--color-text-primary);
+  font-size: 12px;
+  font-weight: 720;
+  line-height: 1.25;
+}
+
+.tf-popover__title + .tf-popover__content {
+  margin-top: 4px;
+}
+
+.tf-popover__meta {
+  display: block;
+  margin-top: 3px;
+  color: var(--color-text-muted);
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.tf-popover__arrow {
+  fill: rgba(16, 22, 32, 0.98);
+  stroke: var(--color-border-default);
+}
