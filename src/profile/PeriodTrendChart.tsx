@@ -27,30 +27,55 @@ export interface TrendBucketReadout {
   empty: boolean;
 }
 
-function formatHourMinute(value: string): string {
-  const match = value.match(/T(\d{2}):(\d{2})/);
-  if (!match) return "";
-  return `${match[1]}:${match[2]}`;
+function parseDate(value: string): Date | null {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function formatBucketRange(bucket: PeriodUsageTrendBucket): string {
+function padTwo(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function formatHourMinute(value: string): string {
+  const date = parseDate(value);
+  if (!date) return "";
+  return `${padTwo(date.getHours())}:${padTwo(date.getMinutes())}`;
+}
+
+function formatLocalDate(value: string): string {
+  const date = parseDate(value);
+  if (!date) return "";
+  return `${padTwo(date.getMonth() + 1)}-${padTwo(date.getDate())}`;
+}
+
+function formatLocalYearMonth(value: string): string {
+  const date = parseDate(value);
+  if (!date) return "";
+  return `${date.getFullYear()}-${padTwo(date.getMonth() + 1)}`;
+}
+
+function formatBucketRange(unit: PeriodUsageTrend["unit"], bucket: PeriodUsageTrendBucket): string {
+  if (unit === "day") return formatLocalDate(bucket.started_at);
+  if (unit === "month") return formatLocalYearMonth(bucket.started_at);
+
   const start = formatHourMinute(bucket.started_at);
   const end = formatHourMinute(bucket.ended_at);
   if (!start || !end) return "";
   return `${start}-${end}`;
 }
 
-export function formatTrendBucketReadout(bucket: PeriodUsageTrendBucket): TrendBucketReadout {
+export function formatTrendBucketReadout(unit: PeriodUsageTrend["unit"], bucket: PeriodUsageTrendBucket): TrendBucketReadout {
   const title = bucket.label;
   const value = `${formatCompactTokens(bucket.total_tokens ?? 0)} token`;
-  const meta = formatBucketRange(bucket);
+  const meta = formatBucketRange(unit, bucket);
   const empty = bucket.total_tokens === 0;
+  const ariaParts = [title, meta, value].filter(Boolean);
 
   return {
     title,
     value,
     meta,
-    ariaLabel: empty ? `${title} ${meta} ${value}，无用量` : `${title} ${meta} ${value}`,
+    ariaLabel: empty ? `${ariaParts.join(" ")}，无用量` : ariaParts.join(" "),
     empty,
   };
 }
@@ -129,9 +154,10 @@ export function PeriodTrendChart({ trend }: { trend: PeriodUsageTrend | null | u
   const endpoint = points[points.length - 1] ?? null;
   const peak = trend ? maxTokens(observedBuckets(trend)) : 0;
   const hasUsage = peak > 0;
+  const trendUnit = trend?.unit ?? "hour";
   const [activePoint, setActivePoint] = useState<Point | null>(null);
   const [referenceElement, setReferenceElement] = useState<SVGCircleElement | null>(null);
-  const activeReadout = activePoint ? formatTrendBucketReadout(activePoint.bucket) : null;
+  const activeReadout = activePoint ? formatTrendBucketReadout(trendUnit, activePoint.bucket) : null;
   const chartDescription = hasUsage
     ? `峰值 ${formatCompactTokens(peak)} token，未来时间桶不计入曲线`
     : "暂无用量，未来时间桶不计入曲线";
@@ -196,7 +222,7 @@ export function PeriodTrendChart({ trend }: { trend: PeriodUsageTrend | null | u
             />
           ) : null}
           {points.map((point) => {
-            const readout = formatTrendBucketReadout(point.bucket);
+            const readout = formatTrendBucketReadout(trendUnit, point.bucket);
             return (
               <circle
                 key={`${point.bucket.key}-hit`}

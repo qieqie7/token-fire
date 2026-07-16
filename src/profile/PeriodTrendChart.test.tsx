@@ -9,32 +9,32 @@ const trend: PeriodUsageTrend = {
     {
       key: "h00",
       label: "0",
-      started_at: "2026-07-04T00:00:00Z",
-      ended_at: "2026-07-04T01:00:00Z",
+      started_at: "2026-07-04T00:00:00",
+      ended_at: "2026-07-04T01:00:00",
       total_tokens: 0,
       is_future: false,
     },
     {
       key: "h01",
       label: "1",
-      started_at: "2026-07-04T01:00:00Z",
-      ended_at: "2026-07-04T02:00:00Z",
+      started_at: "2026-07-04T01:00:00",
+      ended_at: "2026-07-04T02:00:00",
       total_tokens: 2_000_000,
       is_future: false,
     },
     {
       key: "h02",
       label: "2",
-      started_at: "2026-07-04T02:00:00Z",
-      ended_at: "2026-07-04T03:00:00Z",
+      started_at: "2026-07-04T02:00:00",
+      ended_at: "2026-07-04T03:00:00",
       total_tokens: 3_000_000,
       is_future: false,
     },
     {
       key: "h03",
       label: "3",
-      started_at: "2026-07-04T03:00:00Z",
-      ended_at: "2026-07-04T04:00:00Z",
+      started_at: "2026-07-04T03:00:00",
+      ended_at: "2026-07-04T04:00:00",
       total_tokens: null,
       is_future: true,
     },
@@ -48,7 +48,7 @@ const trend: PeriodUsageTrend = {
 
 describe("PeriodTrendChart", () => {
   it("formats trend readouts without cost", () => {
-    expect(formatTrendBucketReadout(trend.buckets[2])).toEqual({
+    expect(formatTrendBucketReadout(trend.unit, trend.buckets[2])).toEqual({
       title: "2",
       value: "3.00M token",
       meta: "02:00-03:00",
@@ -56,12 +56,48 @@ describe("PeriodTrendChart", () => {
       empty: false,
     });
 
-    expect(formatTrendBucketReadout(trend.buckets[0])).toEqual({
+    expect(formatTrendBucketReadout(trend.unit, trend.buckets[0])).toEqual({
       title: "0",
       value: "0 token",
       meta: "00:00-01:00",
       ariaLabel: "0 00:00-01:00 0 token，无用量",
       empty: true,
+    });
+  });
+
+  it("uses calendar labels for day and month buckets instead of midnight hour ranges", () => {
+    expect(
+      formatTrendBucketReadout("day", {
+        key: "d11",
+        label: "11",
+        started_at: "2026-07-10T16:00:00Z",
+        ended_at: "2026-07-11T16:00:00Z",
+        total_tokens: 255_460_000,
+        is_future: false,
+      }),
+    ).toEqual({
+      title: "11",
+      value: "255.46M token",
+      meta: "07-11",
+      ariaLabel: "11 07-11 255.46M token",
+      empty: false,
+    });
+
+    expect(
+      formatTrendBucketReadout("month", {
+        key: "m07",
+        label: "7",
+        started_at: "2026-06-30T16:00:00Z",
+        ended_at: "2026-07-31T16:00:00Z",
+        total_tokens: 255_460_000,
+        is_future: false,
+      }),
+    ).toEqual({
+      title: "7",
+      value: "255.46M token",
+      meta: "2026-07",
+      ariaLabel: "7 2026-07 255.46M token",
+      empty: false,
     });
   });
 
