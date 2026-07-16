@@ -1,3 +1,5 @@
+import { useState, type PointerEvent } from "react";
+import { Popover } from "../design-system/Popover";
 import type { PeriodUsageTrend, PeriodUsageTrendBucket } from "./types";
 import { formatCompactTokens } from "./format";
 
@@ -15,6 +17,42 @@ interface Point {
   x: number;
   y: number;
   bucket: PeriodUsageTrendBucket;
+}
+
+export interface TrendBucketReadout {
+  title: string;
+  value: string;
+  meta: string;
+  ariaLabel: string;
+  empty: boolean;
+}
+
+function formatHourMinute(value: string): string {
+  const match = value.match(/T(\d{2}):(\d{2})/);
+  if (!match) return "";
+  return `${match[1]}:${match[2]}`;
+}
+
+function formatBucketRange(bucket: PeriodUsageTrendBucket): string {
+  const start = formatHourMinute(bucket.started_at);
+  const end = formatHourMinute(bucket.ended_at);
+  if (!start || !end) return "";
+  return `${start}-${end}`;
+}
+
+export function formatTrendBucketReadout(bucket: PeriodUsageTrendBucket): TrendBucketReadout {
+  const title = bucket.label;
+  const value = `${formatCompactTokens(bucket.total_tokens ?? 0)} token`;
+  const meta = formatBucketRange(bucket);
+  const empty = bucket.total_tokens === 0;
+
+  return {
+    title,
+    value,
+    meta,
+    ariaLabel: empty ? `${title} ${meta} ${value}，无用量` : `${title} ${meta} ${value}`,
+    empty,
+  };
 }
 
 function observedBuckets(trend: PeriodUsageTrend): PeriodUsageTrendBucket[] {
@@ -91,9 +129,22 @@ export function PeriodTrendChart({ trend }: { trend: PeriodUsageTrend | null | u
   const endpoint = points[points.length - 1] ?? null;
   const peak = trend ? maxTokens(observedBuckets(trend)) : 0;
   const hasUsage = peak > 0;
+  const [activePoint, setActivePoint] = useState<Point | null>(null);
+  const [referenceElement, setReferenceElement] = useState<SVGCircleElement | null>(null);
+  const activeReadout = activePoint ? formatTrendBucketReadout(activePoint.bucket) : null;
   const chartDescription = hasUsage
     ? `峰值 ${formatCompactTokens(peak)} token，未来时间桶不计入曲线`
     : "暂无用量，未来时间桶不计入曲线";
+
+  const activatePoint = (point: Point, element: SVGCircleElement) => {
+    setActivePoint(point);
+    setReferenceElement(element);
+  };
+
+  const clearActivePoint = () => {
+    setActivePoint(null);
+    setReferenceElement(null);
+  };
 
   return (
     <section className="profile-panel profile-trend" aria-label="Token 趋势">
@@ -106,6 +157,16 @@ export function PeriodTrendChart({ trend }: { trend: PeriodUsageTrend | null | u
           <desc>{chartDescription}</desc>
           <line className="profile-trend__baseline" x1={PLOT_X_START} y1={CHART_HEIGHT - PAD_BOTTOM} x2={PLOT_X_END} y2={CHART_HEIGHT - PAD_BOTTOM} />
           {linePath ? <path className="profile-trend__line" d={linePath} /> : null}
+          {activePoint ? (
+            <line
+              className="profile-trend__active-line"
+              data-active-bucket={activePoint.bucket.key}
+              x1={activePoint.x}
+              y1={activePoint.y}
+              x2={activePoint.x}
+              y2={CHART_HEIGHT - PAD_BOTTOM}
+            />
+          ) : null}
           {points.map((point) => (
             <circle
               key={point.bucket.key}
@@ -125,6 +186,32 @@ export function PeriodTrendChart({ trend }: { trend: PeriodUsageTrend | null | u
               r="3.8"
             />
           ) : null}
+          {activePoint ? (
+            <circle
+              className="profile-trend__point-active"
+              data-active-bucket={activePoint.bucket.key}
+              cx={activePoint.x}
+              cy={activePoint.y}
+              r="5"
+            />
+          ) : null}
+          {points.map((point) => {
+            const readout = formatTrendBucketReadout(point.bucket);
+            return (
+              <circle
+                key={`${point.bucket.key}-hit`}
+                className="profile-trend__point-hit"
+                data-point-hit-bucket={point.bucket.key}
+                cx={point.x}
+                cy={point.y}
+                r="10"
+                aria-label={readout.ariaLabel}
+                onPointerEnter={(event: PointerEvent<SVGCircleElement>) => activatePoint(point, event.currentTarget)}
+                onPointerMove={(event: PointerEvent<SVGCircleElement>) => activatePoint(point, event.currentTarget)}
+                onPointerLeave={clearActivePoint}
+              />
+            );
+          })}
           {trend
             ? trend.x_ticks.map((tick, index) => (
                 <text
@@ -141,6 +228,20 @@ export function PeriodTrendChart({ trend }: { trend: PeriodUsageTrend | null | u
         </svg>
         {!hasUsage ? <span className="profile-trend__empty">暂无用量</span> : null}
       </div>
+      <Popover
+        open={Boolean(activeReadout)}
+        reference={referenceElement}
+        title={activeReadout?.title}
+        content={
+          activeReadout ? (
+            <>
+              {activeReadout.value}
+              {activeReadout.empty ? <span className="tf-popover__meta">无用量</span> : null}
+              {activeReadout.meta ? <span className="tf-popover__meta">{activeReadout.meta}</span> : null}
+            </>
+          ) : null
+        }
+      />
     </section>
   );
 }

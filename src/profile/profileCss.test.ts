@@ -37,6 +37,20 @@ describe("profile css", () => {
     expect(css).not.toContain("box-shadow: 0 0 0 8px");
   });
 
+  it("keeps trend point readouts minimal", () => {
+    const css = readFileSync(profileCssPath, "utf8");
+    const trendHit = cssBlock(css, ".profile-trend__point-hit");
+    const trendActiveLine = cssBlock(css, ".profile-trend__active-line");
+    const trendActivePoint = cssBlock(css, ".profile-trend__point-active");
+
+    expect(trendHit).toContain("fill: transparent;");
+    expect(trendHit).toContain("cursor: default;");
+    expect(trendActiveLine).toContain("stroke-width: 1;");
+    expect(trendActivePoint).toContain("fill: #ff8a34;");
+    expect(css).not.toContain("filter: drop-shadow");
+    expect(css).not.toContain("stroke-dasharray: 3 3");
+  });
+
   it("keeps the fixed menubar profile layout non-scrollable with aligned metric and attribution grids", () => {
     const css = readFileSync(profileCssPath, "utf8");
     const popover = cssBlock(css, ".profile-popover");

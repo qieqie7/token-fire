@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { PeriodTrendChart } from "./PeriodTrendChart";
+import { PeriodTrendChart, formatTrendBucketReadout } from "./PeriodTrendChart";
 import type { PeriodUsageTrend } from "./types";
 
 const trend: PeriodUsageTrend = {
@@ -47,7 +47,36 @@ const trend: PeriodUsageTrend = {
 };
 
 describe("PeriodTrendChart", () => {
-  it("renders ticks, peak label, and same-color current endpoint without future points", () => {
+  it("formats trend readouts without cost", () => {
+    expect(formatTrendBucketReadout(trend.buckets[2])).toEqual({
+      title: "2",
+      value: "3.00M token",
+      meta: "02:00-03:00",
+      ariaLabel: "2 02:00-03:00 3.00M token",
+      empty: false,
+    });
+
+    expect(formatTrendBucketReadout(trend.buckets[0])).toEqual({
+      title: "0",
+      value: "0 token",
+      meta: "00:00-01:00",
+      ariaLabel: "0 00:00-01:00 0 token，无用量",
+      empty: true,
+    });
+  });
+
+  it("renders hover hit circles for elapsed buckets only", () => {
+    const html = renderToStaticMarkup(<PeriodTrendChart trend={trend} />);
+
+    expect(html).toContain('data-point-hit-bucket="h00"');
+    expect(html).toContain('data-point-hit-bucket="h01"');
+    expect(html).toContain('data-point-hit-bucket="h02"');
+    expect(html).not.toContain('data-point-hit-bucket="h03"');
+    expect(html).toContain('r="10"');
+    expect(html).toContain('aria-label="2 02:00-03:00 3.00M token"');
+  });
+
+  it("keeps existing line, endpoint, and tick behavior", () => {
     const html = renderToStaticMarkup(<PeriodTrendChart trend={trend} />);
 
     expect(html).toContain("Token 趋势");

@@ -260,6 +260,22 @@
   fill: transparent;
 }
 
+.profile-trend__point-hit {
+  fill: transparent;
+  cursor: default;
+}
+
+.profile-trend__active-line {
+  stroke: rgba(255, 255, 255, 0.18);
+  stroke-width: 1;
+}
+
+.profile-trend__point-active {
+  fill: #ff8a34;
+  stroke: var(--color-surface-widget);
+  stroke-width: 2.5;
+}
+
 .profile-trend__endpoint {
   fill: #ff8a34;
   stroke: var(--color-surface-widget);
