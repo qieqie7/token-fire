@@ -157,6 +157,29 @@ describe("ProfilePopover", () => {
     expect(html).not.toContain("峰值周");
   });
 
+  it("keeps chart readout infrastructure scoped to chart elements", () => {
+    const html = renderToStaticMarkup(
+      <ProfilePopover
+        period="this_month"
+        summary={summary}
+        loading={false}
+        error={false}
+        buildIdentity={buildIdentity}
+        onPeriodChange={() => {}}
+      />,
+    );
+
+    const heatmapStart = html.indexOf("profile-heatmap__day");
+    const heatmapEnd = html.indexOf("profile-heatmap__months");
+    const heatmapHtml = html.slice(heatmapStart, heatmapEnd);
+
+    expect(heatmapHtml).not.toContain("title=");
+    expect(html).toContain("profile-trend__point-hit");
+    expect(html).not.toContain("profile-trend__future");
+    expect(html).not.toContain('data-point-hit-bucket="d04"');
+    expect(html).toContain("TokenFire v0.1.1");
+  });
+
   it("keeps the TokenFire identity visible during errors without maintenance controls", () => {
     const html = renderToStaticMarkup(
       <ProfilePopover

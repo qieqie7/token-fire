@@ -51,6 +51,17 @@ describe("profile css", () => {
     expect(css).not.toContain("stroke-dasharray: 3 3");
   });
 
+  it("keeps chart readouts minimal and avoids card-like effects", () => {
+    const css = readFileSync(profileCssPath, "utf8");
+
+    expect(css).toContain('.profile-heatmap__day[data-active="true"]');
+    expect(css).toContain(".profile-trend__point-active");
+    expect(css).toContain(".profile-trend__active-line");
+    expect(css).not.toContain("filter: drop-shadow");
+    expect(css).not.toContain("0 18px 40px");
+    expect(css).not.toContain("profile-popover-root");
+  });
+
   it("keeps the fixed menubar profile layout non-scrollable with aligned metric and attribution grids", () => {
     const css = readFileSync(profileCssPath, "utf8");
     const popover = cssBlock(css, ".profile-popover");
