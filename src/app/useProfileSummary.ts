@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useState } from "react";
+import { DEFAULT_PROFILE_PERIOD } from "../profile/defaultPeriod";
 import type { ProfilePeriod, ProfileSummary } from "../profile/types";
 
 export const USAGE_FACTS_INVALIDATED_EVENT = "usage_facts_invalidated";
@@ -46,7 +47,7 @@ export function createProfileSummaryController({
   clearInterval,
 }: ProfileSummaryControllerOptions) {
   let latestRequestId = 0;
-  let currentPeriod: ProfilePeriod = "this_month";
+  let currentPeriod: ProfilePeriod = DEFAULT_PROFILE_PERIOD;
   let intervalId: number | undefined;
   let unlisten: (() => void) | undefined;
   let stopped = true;

@@ -8,6 +8,7 @@ import {
   loadProfileSummary,
   subscribeProfileSummaryRefresh,
 } from "./useProfileSummary";
+import { DEFAULT_PROFILE_PERIOD } from "../profile/defaultPeriod";
 import type { ProfileSummary } from "../profile/types";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -96,12 +97,16 @@ async function flushProfileRefresh() {
 }
 
 describe("profile summary loader", () => {
+  it("defines today as the frontend default profile period", () => {
+    expect(DEFAULT_PROFILE_PERIOD).toBe("today");
+  });
+
   it("invokes profile_summary with the selected calendar period", async () => {
     vi.mocked(invoke).mockResolvedValue(summary);
 
-    await expect(loadProfileSummary("this_month")).resolves.toEqual(summary);
+    await expect(loadProfileSummary("today")).resolves.toEqual(summary);
 
-    expect(invoke).toHaveBeenCalledWith("profile_summary", { period: "this_month" });
+    expect(invoke).toHaveBeenCalledWith("profile_summary", { period: "today" });
   });
 
   it("subscribes to usage fact invalidation and profile open focus events", async () => {

@@ -8,6 +8,10 @@ import { App, handleSourceDiagnosticsAction } from "./App";
 let releaseUpdateForApp: ReleaseUpdateStatus | null = null;
 let currentWindowLabel = "main";
 
+const useProfileSummaryMock = vi.hoisted(() =>
+  vi.fn(() => ({ summary: null, loading: false, error: false })),
+);
+
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({ label: currentWindowLabel }),
 }));
@@ -17,7 +21,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 vi.mock("./useProfileSummary", () => ({
-  useProfileSummary: () => ({ summary: null, loading: false, error: false }),
+  useProfileSummary: useProfileSummaryMock,
 }));
 
 vi.mock("../source-diagnostics/useSourceDiagnostics", () => ({
@@ -45,12 +49,14 @@ vi.mock("./useReleaseUpdate", () => ({
 }));
 
 describe("App", () => {
-  it("defaults the profile period to this_month", () => {
+  it("defaults the profile period to today", () => {
+    useProfileSummaryMock.mockClear();
     const html = renderToStaticMarkup(<App />);
 
     expect(html).toMatch(
-      /<button\b(?=[^>]*role="tab")(?=[^>]*aria-selected="true")[^>]*>当月<\/button>/,
+      /<button\b(?=[^>]*role="tab")(?=[^>]*aria-selected="true")[^>]*>当日<\/button>/,
     );
+    expect(useProfileSummaryMock).toHaveBeenCalledWith("today");
     expect(html).toContain("v0.1.1 · 7e17eb0");
   });
 

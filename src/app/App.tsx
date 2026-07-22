@@ -2,6 +2,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ProfilePopover } from "../profile/ProfilePopover";
+import { DEFAULT_PROFILE_PERIOD } from "../profile/defaultPeriod";
 import type { ProfilePeriod } from "../profile/types";
 import { SourceDiagnostics } from "../source-diagnostics/SourceDiagnostics";
 import type { DiagnosticAction } from "../source-diagnostics/types";
@@ -27,7 +28,7 @@ function currentWindowLabel(): string {
 }
 
 function ProfileApp() {
-  const [period, setPeriod] = useState<ProfilePeriod>("this_month");
+  const [period, setPeriod] = useState<ProfilePeriod>(DEFAULT_PROFILE_PERIOD);
   const { summary, loading, error } = useProfileSummary(period);
   const buildIdentity = useBuildIdentity();
   const releaseUpdate = useReleaseUpdate();
