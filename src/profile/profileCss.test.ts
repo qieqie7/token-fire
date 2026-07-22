@@ -37,9 +37,9 @@ describe("profile css", () => {
     expect(css).not.toContain("box-shadow: 0 0 0 8px");
   });
 
-  it("keeps trend point readouts minimal", () => {
+  it("keeps trend bucket readouts minimal", () => {
     const css = readFileSync(profileCssPath, "utf8");
-    const trendHit = cssBlock(css, ".profile-trend__point-hit");
+    const trendHit = cssBlock(css, ".profile-trend__bucket-hit");
     const trendActiveLine = cssBlock(css, ".profile-trend__active-line");
     const trendActivePoint = cssBlock(css, ".profile-trend__point-active");
 
@@ -47,6 +47,7 @@ describe("profile css", () => {
     expect(trendHit).toContain("cursor: default;");
     expect(trendActiveLine).toContain("stroke-width: 1;");
     expect(trendActivePoint).toContain("fill: #ff8a34;");
+    expect(css).not.toContain(".profile-trend__point-hit");
     expect(css).not.toContain("filter: drop-shadow");
     expect(css).not.toContain("stroke-dasharray: 3 3");
   });
@@ -55,6 +56,7 @@ describe("profile css", () => {
     const css = readFileSync(profileCssPath, "utf8");
 
     expect(css).toContain('.profile-heatmap__day[data-active="true"]');
+    expect(css).toContain(".profile-trend__bucket-hit");
     expect(css).toContain(".profile-trend__point-active");
     expect(css).toContain(".profile-trend__active-line");
     expect(css).not.toContain("filter: drop-shadow");

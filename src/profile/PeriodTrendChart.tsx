@@ -12,6 +12,9 @@ const PAD_TOP = 10;
 const PAD_BOTTOM = 14;
 const PLOT_X_START = PAD_X;
 const PLOT_X_END = WIDTH - PAD_X;
+const PLOT_Y_START = PAD_TOP;
+const PLOT_Y_END = CHART_HEIGHT - PAD_BOTTOM;
+const BUCKET_HIT_WIDTH = 14;
 
 interface Point {
   x: number;
@@ -20,7 +23,6 @@ interface Point {
 }
 
 export interface TrendBucketReadout {
-  title: string;
   value: string;
   meta: string;
   ariaLabel: string;
@@ -65,14 +67,12 @@ function formatBucketRange(unit: PeriodUsageTrend["unit"], bucket: PeriodUsageTr
 }
 
 export function formatTrendBucketReadout(unit: PeriodUsageTrend["unit"], bucket: PeriodUsageTrendBucket): TrendBucketReadout {
-  const title = bucket.label;
   const value = `${formatCompactTokens(bucket.total_tokens ?? 0)} token`;
   const meta = formatBucketRange(unit, bucket);
-  const empty = bucket.total_tokens === 0;
-  const ariaParts = [title, meta, value].filter(Boolean);
+  const empty = (bucket.total_tokens ?? 0) === 0;
+  const ariaParts = [bucket.label, meta, value].filter(Boolean);
 
   return {
-    title,
     value,
     meta,
     ariaLabel: empty ? `${ariaParts.join(" ")}，无用量` : ariaParts.join(" "),
@@ -117,6 +117,15 @@ function pointsFor(trend: PeriodUsageTrend): Point[] {
     .filter((point): point is Point => point !== null);
 }
 
+function bucketHitWidth(points: Point[]): number {
+  if (points.length <= 1) return BUCKET_HIT_WIDTH;
+  const minSpacing = points.slice(1).reduce((min, point, index) => {
+    const previous = points[index];
+    return Math.min(min, Math.abs(point.x - previous.x));
+  }, Number.POSITIVE_INFINITY);
+  return Math.min(BUCKET_HIT_WIDTH, Math.max(8, minSpacing * 0.45));
+}
+
 function smoothLinePath(points: Point[]): string {
   if (points.length === 0) return "";
   if (points.length === 1) return `M ${points[0].x} ${points[0].y}`;
@@ -156,13 +165,14 @@ export function PeriodTrendChart({ trend }: { trend: PeriodUsageTrend | null | u
   const hasUsage = peak > 0;
   const trendUnit = trend?.unit ?? "hour";
   const [activePoint, setActivePoint] = useState<Point | null>(null);
-  const [referenceElement, setReferenceElement] = useState<SVGCircleElement | null>(null);
+  const [referenceElement, setReferenceElement] = useState<SVGRectElement | null>(null);
   const activeReadout = activePoint ? formatTrendBucketReadout(trendUnit, activePoint.bucket) : null;
+  const bucketHitWidthValue = bucketHitWidth(points);
   const chartDescription = hasUsage
     ? `峰值 ${formatCompactTokens(peak)} token，未来时间桶不计入曲线`
     : "暂无用量，未来时间桶不计入曲线";
 
-  const activatePoint = (point: Point, element: SVGCircleElement) => {
+  const activatePoint = (point: Point, element: SVGRectElement) => {
     setActivePoint(point);
     setReferenceElement(element);
   };
@@ -224,16 +234,17 @@ export function PeriodTrendChart({ trend }: { trend: PeriodUsageTrend | null | u
           {points.map((point) => {
             const readout = formatTrendBucketReadout(trendUnit, point.bucket);
             return (
-              <circle
+              <rect
                 key={`${point.bucket.key}-hit`}
-                className="profile-trend__point-hit"
-                data-point-hit-bucket={point.bucket.key}
-                cx={point.x}
-                cy={point.y}
-                r="10"
+                className="profile-trend__bucket-hit"
+                data-bucket-hit={point.bucket.key}
+                x={point.x - bucketHitWidthValue / 2}
+                y={PLOT_Y_START}
+                width={bucketHitWidthValue}
+                height={PLOT_Y_END - PLOT_Y_START}
                 aria-label={readout.ariaLabel}
-                onPointerEnter={(event: PointerEvent<SVGCircleElement>) => activatePoint(point, event.currentTarget)}
-                onPointerMove={(event: PointerEvent<SVGCircleElement>) => activatePoint(point, event.currentTarget)}
+                onPointerEnter={(event: PointerEvent<SVGRectElement>) => activatePoint(point, event.currentTarget)}
+                onPointerMove={(event: PointerEvent<SVGRectElement>) => activatePoint(point, event.currentTarget)}
                 onPointerLeave={clearActivePoint}
               />
             );
@@ -257,13 +268,12 @@ export function PeriodTrendChart({ trend }: { trend: PeriodUsageTrend | null | u
       <Popover
         open={Boolean(activeReadout)}
         reference={referenceElement}
-        title={activeReadout?.title}
         content={
           activeReadout ? (
             <>
               {activeReadout.value}
-              {activeReadout.empty ? <span className="tf-popover__meta">无用量</span> : null}
               {activeReadout.meta ? <span className="tf-popover__meta">{activeReadout.meta}</span> : null}
+              {activeReadout.empty ? <span className="tf-popover__meta">无用量</span> : null}
             </>
           ) : null
         }

@@ -174,7 +174,8 @@ describe("ProfilePopover", () => {
     const heatmapHtml = html.slice(heatmapStart, heatmapEnd);
 
     expect(heatmapHtml).not.toContain("title=");
-    expect(html).toContain("profile-trend__point-hit");
+    expect(html).toContain("profile-trend__bucket-hit");
+    expect(html).not.toContain("profile-trend__point-hit");
     expect(html).not.toContain("profile-trend__future");
     expect(html).not.toContain('data-point-hit-bucket="d04"');
     expect(html).toContain("TokenFire v0.1.1");

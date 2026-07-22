@@ -47,9 +47,8 @@ const trend: PeriodUsageTrend = {
 };
 
 describe("PeriodTrendChart", () => {
-  it("formats trend readouts without cost", () => {
+  it("formats trend readouts with token value first and no visual title", () => {
     expect(formatTrendBucketReadout(trend.unit, trend.buckets[2])).toEqual({
-      title: "2",
       value: "3.00M token",
       meta: "02:00-03:00",
       ariaLabel: "2 02:00-03:00 3.00M token",
@@ -57,7 +56,18 @@ describe("PeriodTrendChart", () => {
     });
 
     expect(formatTrendBucketReadout(trend.unit, trend.buckets[0])).toEqual({
-      title: "0",
+      value: "0 token",
+      meta: "00:00-01:00",
+      ariaLabel: "0 00:00-01:00 0 token，无用量",
+      empty: true,
+    });
+
+    expect(
+      formatTrendBucketReadout(trend.unit, {
+        ...trend.buckets[0],
+        total_tokens: null,
+      }),
+    ).toEqual({
       value: "0 token",
       meta: "00:00-01:00",
       ariaLabel: "0 00:00-01:00 0 token，无用量",
@@ -76,7 +86,6 @@ describe("PeriodTrendChart", () => {
         is_future: false,
       }),
     ).toEqual({
-      title: "11",
       value: "255.46M token",
       meta: "07-11",
       ariaLabel: "11 07-11 255.46M token",
@@ -93,7 +102,6 @@ describe("PeriodTrendChart", () => {
         is_future: false,
       }),
     ).toEqual({
-      title: "7",
       value: "255.46M token",
       meta: "2026-07",
       ariaLabel: "7 2026-07 255.46M token",
@@ -101,15 +109,23 @@ describe("PeriodTrendChart", () => {
     });
   });
 
-  it("renders hover hit circles for elapsed buckets only", () => {
+  it("renders narrow vertical hover hit bands for elapsed buckets only", () => {
     const html = renderToStaticMarkup(<PeriodTrendChart trend={trend} />);
 
-    expect(html).toContain('data-point-hit-bucket="h00"');
-    expect(html).toContain('data-point-hit-bucket="h01"');
-    expect(html).toContain('data-point-hit-bucket="h02"');
-    expect(html).not.toContain('data-point-hit-bucket="h03"');
-    expect(html).toContain('r="10"');
+    expect(html).toContain('data-bucket-hit="h00"');
+    expect(html).toContain('data-bucket-hit="h01"');
+    expect(html).toContain('data-bucket-hit="h02"');
+    expect(html).not.toContain('data-bucket-hit="h03"');
+    expect(html).toContain('<rect class="profile-trend__bucket-hit"');
+    expect(html).toContain('x="3"');
+    expect(html).toContain('x="103"');
+    expect(html).toContain('x="203"');
+    expect(html).toContain('y="10"');
+    expect(html).toContain('width="14"');
+    expect(html).toContain('height="40"');
     expect(html).toContain('aria-label="2 02:00-03:00 3.00M token"');
+    expect(html).not.toContain("profile-trend__point-hit");
+    expect(html).not.toContain('r="10"');
   });
 
   it("keeps existing line, endpoint, and tick behavior", () => {
@@ -182,6 +198,8 @@ describe("PeriodTrendChart", () => {
 
     expect(html).toContain("峰值 1.00M token");
     expect(html).toContain('data-current-bucket="h00"');
+    expect(html).toContain('data-bucket-hit="h00"');
+    expect(html).toContain('height="40"');
     expect(html).toContain("profile-trend__endpoint");
   });
 
